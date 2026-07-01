@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+build/
+dist/
+*.egg-info/
+.venv/
+
+# Ad-hoc UDP captures. The two named fixtures
+# (recordings/single_frequency.pkl, recordings/change_frequency.pkl) stay tracked.
+# Unanchored pattern too: until Stage 1, recieve_udp.py writes captures to the CWD.
+udp_capture_*.pkl
+recordings/udp_capture_*.pkl

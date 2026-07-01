@@ -1,0 +1,17 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sceptre-pipeline"
+version = "0.1.0"
+description = "Live ingestion pipeline for a Sceptre SDR streaming IQ data over UDP (VITA-49.2 subset)."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["numpy"]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sceptre_pipeline"]
