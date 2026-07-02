@@ -234,6 +234,14 @@ class Interpreter:
                     )
                     self._warned_no_context = True
                 return None
+            bytes_per_sample = self._current_context.get("bytes_per_sample")
+            if bytes_per_sample is None:
+                logger.warning(
+                    "current context has no data payload format (CIF bit 15); "
+                    "dropping data packet on stream %d",
+                    hdr.stream_id,
+                )
+                return None
             prev = self._last_counter.get(hdr.stream_id)
             gap_before = prev is not None and hdr.packet_counter != (prev + 1) % 16
             if gap_before:
@@ -244,9 +252,7 @@ class Interpreter:
                     hdr.packet_counter,
                 )
             self._last_counter[hdr.stream_id] = hdr.packet_counter
-            body, _num_samples = trim_data(
-                raw, hdr, self._current_context["bytes_per_sample"]
-            )
+            body, _num_samples = trim_data(raw, hdr, bytes_per_sample)
             return {
                 "type": "data",
                 "metadata": self._metadata(

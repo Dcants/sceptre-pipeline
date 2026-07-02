@@ -108,14 +108,17 @@ def test_trim_is_pure_and_independent_of_format_assertion() -> None:
     assert body == payload
 
 
-def test_trim_without_class_id_or_trailer_flags() -> None:
-    payload = encode_iq_float32([complex(1, 2)])
-    raw = build_data_packet(payload=payload, class_id=False, trailer=False)
+@pytest.mark.parametrize("class_id", [False, True])
+@pytest.mark.parametrize("trailer", [False, True])
+def test_trim_handles_every_flag_combination(class_id: bool, trailer: bool) -> None:
+    """start/end derive from the flags INDEPENDENTLY (C1) — all 4 combos."""
+    payload = encode_iq_float32([complex(1, 2), complex(-3, 4)])
+    raw = build_data_packet(payload=payload, class_id=class_id, trailer=trailer)
     hdr = parse_header(raw)
-    assert hdr.class_id is False and hdr.trailer is False
+    assert hdr.class_id is class_id and hdr.trailer is trailer
     body, num_samples = trim_data(raw, hdr, bytes_per_sample=8)
-    assert num_samples == 1
-    assert body == payload  # payload starts at byte 20 when cid=0
+    assert num_samples == 2
+    assert body == payload
 
 
 def test_trim_logs_packet_size_mismatch(caplog) -> None:
@@ -162,6 +165,21 @@ def test_counter_tracking_is_per_stream() -> None:
     interp.process(build_data_packet(payload=payload, counter=3, stream_id=1))
     r = interp.process(build_data_packet(payload=payload, counter=9, stream_id=2))
     assert r["metadata"]["gap_before"] is False  # different stream, no prev
+
+
+def test_context_without_payload_format_drops_data_with_warning(caplog) -> None:
+    """A context missing CIF bit 15 must not crash Thread B on the next data."""
+    interp = Interpreter()
+    fields = standard_context_fields()
+    del fields[15]  # no Data Packet Payload Format
+    record = interp.process(build_context_packet(fields=fields))
+    assert record["type"] == "context"
+    assert "bytes_per_sample" not in record["context"]
+
+    raw = build_data_packet(payload=encode_iq_float32([complex(1, 1)]))
+    with caplog.at_level(logging.WARNING, logger="sceptre_pipeline.interpreter"):
+        assert interp.process(raw) is None
+    assert any("payload format" in r.getMessage() for r in caplog.records)
 
 
 def test_data_before_context_returns_none_and_warns(caplog) -> None:
