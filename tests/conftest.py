@@ -1,9 +1,17 @@
 """Shared fixtures and synthetic-packet builders for the sceptre-pipeline tests.
 
 The two captures in ``recordings/`` are the empirical ground truth for the wire
-format (see docs/implementation-plan.md, Appendix A). Synthetic packet builders
-cover the paths absent from the real fixtures (gain, GPS, ephemeris, sub-32-bit
-formats) and are filled in from Stage 2 onward.
+format (see docs/implementation-plan.md; Stage 2.5 supersedes Appendix A
+SC1-C3 with the flag-driven header model). Synthetic packet builders cover the
+paths absent from the real fixtures: gain, GPS, ephemeris, sub-32-bit formats,
+and the default Sceptre config (class_id=0, trailer=0 -> 20-byte header).
+
+Wire layout emitted by the builders (Stage 2.5, flag-driven):
+
+    [word0][stream_id][class_id? 8B][int_ts? 4B][frac_ts? 8B][body...]
+
+The Class ID sits BEFORE the timestamps; tsi/tsf of 0 omit the corresponding
+timestamp field entirely, so header length is a pure function of the flags.
 """
 
 from __future__ import annotations
@@ -16,6 +24,11 @@ import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 RECORDINGS_DIR = PROJECT_ROOT / "recordings"
+
+# Real Class IDs observed on the wire (OUI 0xFFFFFA + class codes). Context
+# and data packets carry different class codes; both are constant per capture.
+DATA_CLASS_ID = bytes.fromhex("00fffffa00160000")
+CONTEXT_CLASS_ID = bytes.fromhex("00fffffa20110003")
 
 
 def _load_capture(path: Path | str) -> dict:
@@ -86,6 +99,45 @@ def standard_context_fields(
     }
 
 
+def build_header(
+    *,
+    packet_type: int,
+    total_words: int,
+    stream_id: int,
+    counter: int,
+    int_ts: int,
+    frac_ts: int,
+    class_id: bytes | None,
+    trailer: bool,
+    tsi: int = 1,  # UTC
+    tsf: int = 2,  # real-time picoseconds
+) -> bytes:
+    """Flag-driven header: [word0][stream_id][class_id?][int_ts?][frac_ts?]."""
+    word0 = (
+        ((packet_type & 0xF) << 28)
+        | (int(class_id is not None) << 27)
+        | (int(trailer) << 26)
+        | ((tsi & 0x3) << 22)
+        | ((tsf & 0x3) << 20)
+        | ((counter & 0xF) << 16)
+        | (total_words & 0xFFFF)
+    )
+    hdr = struct.pack(">II", word0, stream_id)
+    if class_id is not None:
+        assert len(class_id) == 8, "Class ID is always 8 bytes on the wire"
+        hdr += class_id
+    if tsi:
+        hdr += struct.pack(">I", int_ts)
+    if tsf:
+        hdr += struct.pack(">Q", frac_ts)
+    return hdr
+
+
+def header_len_for(*, class_id: bool, tsi: int = 1, tsf: int = 2) -> int:
+    """Expected header length for a Sceptre packet (word0 + stream_id always)."""
+    return 8 + (8 if class_id else 0) + (4 if tsi else 0) + (8 if tsf else 0)
+
+
 def build_context_packet(
     *,
     fields: dict[int, bytes],
@@ -94,27 +146,38 @@ def build_context_packet(
     int_ts: int = 1_750_000_000,
     frac_ts: int = 0,
     class_id: bool = True,
+    class_id_bytes: bytes = CONTEXT_CLASS_ID,
+    tsi: int = 1,
+    tsf: int = 2,
 ) -> bytes:
-    """Synthetic VITA-49 IF context packet: [20B header][8B id-word][4B CIF][fields].
+    """Synthetic VITA-49 IF context packet: [header][4B CIF][fields].
 
     ``fields`` maps CIF bit -> raw field bytes; encoded in descending bit order.
     """
     cif = 0
     for bit in fields:
         cif |= 1 << bit
-    payload = b"".join(fields[bit] for bit in sorted(fields, reverse=True))
-    body = (b"\x11" * 8 if class_id else b"") + struct.pack(">I", cif) + payload
-    total = 20 + len(body)
-    assert total % 4 == 0
-    word0 = (
-        (0x4 << 28)
-        | (int(class_id) << 27)
-        | (1 << 22)  # TSI = UTC
-        | (2 << 20)  # TSF = real-time ps
-        | ((counter & 0xF) << 16)
-        | (total // 4)
+    body = struct.pack(">I", cif) + b"".join(
+        fields[bit] for bit in sorted(fields, reverse=True)
     )
-    return struct.pack(">IIIQ", word0, stream_id, int_ts, frac_ts) + body
+    hdr_len = header_len_for(class_id=class_id, tsi=tsi, tsf=tsf)
+    total = hdr_len + len(body)
+    assert total % 4 == 0
+    return (
+        build_header(
+            packet_type=0x4,
+            total_words=total // 4,
+            stream_id=stream_id,
+            counter=counter,
+            int_ts=int_ts,
+            frac_ts=frac_ts,
+            class_id=class_id_bytes if class_id else None,
+            trailer=False,
+            tsi=tsi,
+            tsf=tsf,
+        )
+        + body
+    )
 
 
 def build_data_packet(
@@ -125,28 +188,36 @@ def build_data_packet(
     int_ts: int = 1_750_000_000,
     frac_ts: int = 0,
     class_id: bool = True,
+    class_id_bytes: bytes = DATA_CLASS_ID,
     trailer: bool = True,
-    id_word: bytes = b"\x11" * 8,  # per-packet ps counter on the wire (C3): opaque
+    tsi: int = 1,
+    tsf: int = 2,
     pad: bytes = b"",
 ) -> bytes:
-    """Synthetic VITA-49 IF data packet: [20B header][8B id-word][payload][4B trailer].
+    """Synthetic VITA-49 IF data packet: [header][payload][pad][4B trailer?].
 
     ``pad`` fills the payload to the next 32-bit word for sub-32-bit formats.
     The trailer bytes are deliberately garbage to prove they get trimmed.
     """
-    body = (id_word if class_id else b"") + payload + pad + (b"\xAA" * 4 if trailer else b"")
-    total = 20 + len(body)
+    body = payload + pad + (b"\xAA" * 4 if trailer else b"")
+    hdr_len = header_len_for(class_id=class_id, tsi=tsi, tsf=tsf)
+    total = hdr_len + len(body)
     assert total % 4 == 0, "payload+pad must end on a 32-bit word boundary"
-    word0 = (
-        (0x1 << 28)
-        | (int(class_id) << 27)
-        | (int(trailer) << 26)
-        | (1 << 22)
-        | (2 << 20)
-        | ((counter & 0xF) << 16)
-        | (total // 4)
+    return (
+        build_header(
+            packet_type=0x1,
+            total_words=total // 4,
+            stream_id=stream_id,
+            counter=counter,
+            int_ts=int_ts,
+            frac_ts=frac_ts,
+            class_id=class_id_bytes if class_id else None,
+            trailer=trailer,
+            tsi=tsi,
+            tsf=tsf,
+        )
+        + body
     )
-    return struct.pack(">IIIQ", word0, stream_id, int_ts, frac_ts) + body
 
 
 def encode_iq_float32(samples) -> bytes:

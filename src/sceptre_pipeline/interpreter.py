@@ -1,15 +1,16 @@
 """Header parse, context decode, and data trim for the Sceptre VITA-49.2 subset.
 
-All layout facts follow docs/implementation-plan.md Appendix A (empirically
-verified against the reference recordings; overrides the PDF where they
-conflict). Key corrections honored here:
+All layout facts follow docs/implementation-plan.md Appendix A as amended by
+Stage 2.5 (empirically verified against the reference recordings; overrides
+the PDF where they conflict). Key corrections honored here:
 
-- C1: class_id/trailer flags are SET on real packets — payload bounds derive
-  from the flags, never a fixed offset 20.
+- Stage 2.5: the header is FLAG-DRIVEN — length and every field offset derive
+  from the word0 class_id/trailer/TSI/TSF flags. The 8-byte Class ID (when
+  present) sits BEFORE the timestamps, so the recordings have a 28-byte header
+  (int_ts at 16, frac_ps at 20) while default-config Sceptre has a 20-byte one
+  (timestamps at 8/12). One code path handles both.
 - C2: num_samples comes from the trimmed body length (1020), not the PDF
-  formula (1021, which injects the id-word as a garbage first sample).
-- C3: bytes[20:28] is a per-packet picosecond counter — skipped, never
-  validated as a constant.
+  formula (1021, which injects the tail of the header as a garbage sample).
 """
 
 from __future__ import annotations
@@ -25,65 +26,111 @@ from .formats import (
     CIF_GAIN,
     CIF_RF_REF_FREQ,
     CIF_SAMPLE_RATE,
+    CLASS_ID_SIZE,
     COMPONENT_DTYPE,
     DATA_ITEM_FORMAT_FLOAT,
     EXPECTED_BYTES_PER_SAMPLE,
     FIELD_SIZE,
+    FRAC_TS_SIZE,
+    INT_TS_SIZE,
     PACKET_TYPE_IF_CONTEXT,
     PACKET_TYPE_IF_DATA,
+    PACKET_TYPES_WITH_STREAM_ID,
     RADIX_FREQ_HZ,
     RADIX_GAIN_DB,
+    STREAM_ID_SIZE,
+    TRAILER_SIZE,
+    W0_CLASS_ID_BIT,
+    W0_COUNTER_SHIFT,
+    W0_PACKET_SIZE_MASK,
+    W0_PACKET_TYPE_SHIFT,
+    W0_TRAILER_BIT,
+    W0_TSF_SHIFT,
+    W0_TSI_SHIFT,
+    WORD0_SIZE,
+    header_length,
 )
 
 logger = logging.getLogger(__name__)
 
-HEADER_SIZE = 20  # bytes: word0 + stream_id + int_ts + frac_ts(u64)
-ID_WORD_SIZE = 8  # the per-packet ps counter following the header (C3)
-TRAILER_SIZE = 4
-
 
 @dataclass(frozen=True)
 class Header:
-    """The 20-byte VITA-49 header with the verified word0 bit extraction."""
+    """A VITA-49 header parsed flag-first: every offset derives from word0."""
 
     packet_type: int
-    class_id: bool
-    trailer: bool
+    class_id: bytes | None  # 8-byte Class ID (OUI + class codes), None if absent
+    has_trailer: bool
     tsi: int
     tsf: int
     packet_counter: int
-    packet_size: int  # in 32-bit words
-    stream_id: int
-    int_ts: int  # UTC seconds
-    frac_ts: int  # picoseconds
+    packet_size: int  # in 32-bit words, header included
+    stream_id: int | None  # present on packet types 1/3/4/5
+    int_ts: int | None  # UTC seconds; None when TSI = 0
+    frac_ps: int | None  # picoseconds; None when TSF = 0
+    header_len: int  # bytes; a pure function of the word0 flags
+
+    @property
+    def has_class_id(self) -> bool:
+        return self.class_id is not None
 
     @property
     def timestamp(self) -> float:
-        return self.int_ts + self.frac_ts / 1e12
+        return (self.int_ts or 0) + (self.frac_ps or 0) / 1e12
 
 
 def parse_header(b: bytes) -> Header:
-    if len(b) < HEADER_SIZE:
+    if len(b) < WORD0_SIZE:
         raise ValueError(
-            f"packet too short for VITA-49 header: {len(b)} < {HEADER_SIZE} bytes"
+            f"packet too short for VITA-49 word0: {len(b)} < {WORD0_SIZE} bytes"
         )
-    word0, stream_id, int_ts, frac_ts = struct.unpack(">IIIQ", b[:HEADER_SIZE])
+    word0 = int.from_bytes(b[:WORD0_SIZE], "big")
+    packet_type = (word0 >> W0_PACKET_TYPE_SHIFT) & 0xF
+    has_class_id = bool((word0 >> W0_CLASS_ID_BIT) & 1)
+    has_trailer = bool((word0 >> W0_TRAILER_BIT) & 1)
+    tsi = (word0 >> W0_TSI_SHIFT) & 0x3
+    tsf = (word0 >> W0_TSF_SHIFT) & 0x3
+    has_stream_id = packet_type in PACKET_TYPES_WITH_STREAM_ID
+
+    expected_len = header_length(
+        has_stream_id=has_stream_id, has_class_id=has_class_id, tsi=tsi, tsf=tsf
+    )
+    if len(b) < expected_len:
+        raise ValueError(
+            f"packet too short for its word0 flags: {len(b)} < {expected_len} bytes"
+        )
+
+    off = WORD0_SIZE
+    stream_id = None
+    if has_stream_id:
+        stream_id = int.from_bytes(b[off : off + STREAM_ID_SIZE], "big")
+        off += STREAM_ID_SIZE
+    class_id = None
+    if has_class_id:  # the Class ID sits BEFORE the timestamps
+        class_id = bytes(b[off : off + CLASS_ID_SIZE])
+        off += CLASS_ID_SIZE
+    int_ts = None
+    if tsi:
+        int_ts = int.from_bytes(b[off : off + INT_TS_SIZE], "big")
+        off += INT_TS_SIZE
+    frac_ps = None
+    if tsf:
+        frac_ps = int.from_bytes(b[off : off + FRAC_TS_SIZE], "big")
+        off += FRAC_TS_SIZE
+
     return Header(
-        packet_type=(word0 >> 28) & 0xF,
-        class_id=bool((word0 >> 27) & 1),
-        trailer=bool((word0 >> 26) & 1),
-        tsi=(word0 >> 22) & 0x3,
-        tsf=(word0 >> 20) & 0x3,
-        packet_counter=(word0 >> 16) & 0xF,
-        packet_size=word0 & 0xFFFF,
+        packet_type=packet_type,
+        class_id=class_id,
+        has_trailer=has_trailer,
+        tsi=tsi,
+        tsf=tsf,
+        packet_counter=(word0 >> W0_COUNTER_SHIFT) & 0xF,
+        packet_size=word0 & W0_PACKET_SIZE_MASK,
         stream_id=stream_id,
         int_ts=int_ts,
-        frac_ts=frac_ts,
+        frac_ps=frac_ps,
+        header_len=off,
     )
-
-
-def _payload_start(hdr: Header) -> int:
-    return HEADER_SIZE + (ID_WORD_SIZE if hdr.class_id else 0)
 
 
 def decode_payload_format(u: int) -> dict[str, Any]:
@@ -127,9 +174,10 @@ def decode_context(b: bytes, hdr: Header) -> dict[str, Any]:
 
     Walks CIF bits 31 -> 0 in descending order, advancing by FIELD_SIZE for
     EVERY present bit (decoding only the ones we use) so unexpected optional
-    fields cannot desync the offsets.
+    fields cannot desync the offsets. The CIF begins right after the
+    flag-driven header (``hdr.header_len``).
     """
-    offset = _payload_start(hdr)
+    offset = hdr.header_len
     if len(b) < offset + 4:
         raise ValueError(f"context packet truncated before CIF: {len(b)} bytes")
     cif = struct.unpack_from(">I", b, offset)[0]
@@ -177,8 +225,11 @@ def trim_data(b: bytes, hdr: Header, bytes_per_sample: int) -> tuple[bytes, int]
     """Trim a data packet to its sample payload (pure; no format assertions).
 
     Returns ``(body, num_samples)`` where ``body`` is exactly
-    ``num_samples * bytes_per_sample`` bytes: id-word skipped, trailer dropped,
-    and any word-alignment padding smaller than one sample floored away.
+    ``num_samples * bytes_per_sample`` bytes: the flag-driven header skipped,
+    the trailer (when flagged) dropped, and any word-alignment padding smaller
+    than one sample floored away. Purity matters: the complex-float32 loudness
+    check lives in ``decode_payload_format``, so a future RAW/real-float
+    Sceptre stream can relax it without touching this trim math.
     """
     if len(b) != hdr.packet_size * 4:
         logger.warning(
@@ -187,8 +238,8 @@ def trim_data(b: bytes, hdr: Header, bytes_per_sample: int) -> tuple[bytes, int]
             hdr.packet_size,
             hdr.packet_size * 4,
         )
-    start = _payload_start(hdr)
-    end = len(b) - (TRAILER_SIZE if hdr.trailer else 0)
+    start = hdr.header_len
+    end = len(b) - (TRAILER_SIZE if hdr.has_trailer else 0)
     body = b[start:end]
     num_samples = len(body) // bytes_per_sample
     return body[: num_samples * bytes_per_sample], num_samples
