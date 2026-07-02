@@ -1,16 +1,27 @@
 #!/usr/bin/env python3
+"""Capture raw UDP datagrams to a pickle in the project-root recordings/ dir.
+
+CLI and on-disk schema are unchanged from the original script; the capture
+path now reuses sceptre_pipeline.recorder.Recorder.
+"""
 
 import argparse
-import pickle
 import socket
+import sys
 import time
-from datetime import datetime
 from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+try:
+    from sceptre_pipeline.recorder import Recorder, default_recording_path
+except ImportError:  # package not installed; run straight from the source tree
+    sys.path.insert(0, str(PROJECT_ROOT / "src"))
+    from sceptre_pipeline.recorder import Recorder, default_recording_path
 
 
 def default_output_filename() -> Path:
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return Path(f"udp_capture_{timestamp}.pkl")
+    return default_recording_path(PROJECT_ROOT)
 
 
 def receive_udp(
@@ -20,7 +31,7 @@ def receive_udp(
     output_path: Path,
     buffer_size: int = 65_535,
 ) -> None:
-    packets: list[tuple[int, str, int, bytes]] = []
+    recorder = Recorder()
 
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp_socket:
         udp_socket.bind((host, port))
@@ -36,14 +47,7 @@ def receive_udp(
         capture_start_ns = time.time_ns()
         deadline = time.monotonic() + duration
 
-        packets.append(
-            (
-                capture_start_ns,
-                address[0],
-                address[1],
-                data,
-            )
-        )
+        recorder.append(capture_start_ns, address, data)
 
         print(
             f"First packet received from {address[0]}:{address[1]} "
@@ -65,17 +69,10 @@ def receive_udp(
                 except socket.timeout:
                     break
 
-                packets.append(
-                    (
-                        time.time_ns(),
-                        address[0],
-                        address[1],
-                        data,
-                    )
-                )
+                recorder.append(time.time_ns(), address, data)
 
                 print(
-                    f"Packet {len(packets)}: "
+                    f"Packet {len(recorder)}: "
                     f"{len(data)} bytes from "
                     f"{address[0]}:{address[1]}"
                 )
@@ -83,25 +80,10 @@ def receive_udp(
         except KeyboardInterrupt:
             print("\nCapture interrupted. Saving packets received so far...")
 
-    capture = {
-        "start_time_ns": capture_start_ns,
-        "duration_seconds": duration,
-        "packets": packets,
-    }
+    recorder.save(output_path, capture_start_ns, duration)
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    with output_path.open("wb") as file:
-        pickle.dump(
-            capture,
-            file,
-            protocol=pickle.HIGHEST_PROTOCOL,
-        )
-
-    total_payload_bytes = sum(len(packet[3]) for packet in packets)
-
-    print(f"\nSaved {len(packets)} packets")
-    print(f"Payload bytes: {total_payload_bytes:,}")
+    print(f"\nSaved {len(recorder)} packets")
+    print(f"Payload bytes: {recorder.total_bytes:,}")
     print(f"File: {output_path.resolve()}")
 
 
