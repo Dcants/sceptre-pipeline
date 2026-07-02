@@ -192,6 +192,69 @@ Use `from __future__ import annotations` for `X | None` at runtime on 3.10. Avoi
 
 ---
 
+## Stage 2.5 — Dynamic VITA-49 header parsing (both configs) + buffer flush contract
+
+> **Corrective stage (run after Stages 0–2).** Fixes two issues found by decoding the real recordings. **It supersedes the header/timestamp model in Appendix A §C1–C3** — use the flag-driven model below. **The PDF is correct**: it documents Sceptre's *default* config (`class_id`=0, `trailer`=0 → 20-byte header, timestamps at offsets 8/12). The two recordings were captured with **`class_id` AND `trailer` enabled** (a valid, standard VITA-49 configuration), so their header is **28 bytes** with an 8-byte **Class ID *before* the timestamps**, plus a **4-byte trailer** on data packets. Earlier guidance ("skip 8 bytes *after* the 20-byte header, read timestamps at 8/12") silently read the Class ID as the timestamp and produced a 1970-garbage `start_timestamp`. The interpreter must parse **dynamically from the word0 flags** so one code path handles the recordings *and* live default-config Sceptre.
+
+**Proof from `single_frequency.pkl` (data packet):** `bytes[8:16] = 00fffffa00160000` is identical across all packets → Class ID (OUI `0xfffffa` + class codes). `u32@16 = 1782443209` → `2026-06-26T03:06:49Z` → integer-seconds timestamp. `u64@20` advances by exactly `1,632,000,000` ps/packet (= 1.632 ms = 1020 samples @ 625 kHz) and stays `< 1e12` → fractional-picosecond timestamp.
+
+**Objective.** (1) Replace fixed-offset header parsing in `interpreter.py` with a **flag-driven dynamic parser**: header length and every field offset are computed from the word0 `class_id`/`trailer`/TSI/TSF flags; the Class ID (when present) is skipped *before* the timestamps; the integer/fractional timestamps are read at their true offsets — fixing the garbage `start_timestamp`. The same code must yield a 28-byte header + trailer for the recordings and a 20-byte header + no trailer for default-config live Sceptre, with correct timestamps in both. (2) Lock the buffer **flush contract** so a size/age/gap flush never drops data or opens a time gap: `flush()` must **retain `_current_context`**; data is dropped only at cold start (before the first context packet). Ship a guard test that holds Stage 3 to it.
+
+**Files to create/modify:**
+- modify `src/sceptre_pipeline/interpreter.py` — `parse_header`, `decode_context`, `trim_data`, `Header`
+- modify `src/sceptre_pipeline/formats.py` — word0 flag masks + a header-length helper / field-size constants
+- modify `tests/test_header.py`, `tests/test_context.py`, `tests/test_trim.py` — assert against dynamic offsets (`hdr.header_len`), not hardcoded 20/28
+- create `tests/test_dynamic_header.py` — both configs: real recording bytes (C=1,T=1) and synthetic default bytes (C=0,T=0)
+- create `tests/test_buffer_flush_contract.py` — flush-retains-context guard, gated by `pytest.importorskip("sceptre_pipeline.buffer")`
+
+**Implementation prompt.** *(Include Appendix A, but note this stage OVERRIDES its §C1–C3 header/timestamp offsets with the flag-driven model here. §C4 field-decode, fixed-point, endianness, and the 1020-sample trim remain in force.)*
+
+*Part A — dynamic header. Rewrite `parse_header(b)` so all offsets are derived from word0; do not hardcode 20 or 28:*
+```python
+w0      = int.from_bytes(b[:4], "big")
+ptype   = (w0 >> 28) & 0xF          # 1 = IF data, 4 = IF context
+has_cid = bool((w0 >> 27) & 1)      # bit 4  — Class ID present
+has_trl = bool((w0 >> 26) & 1)      # bit 5  — trailer present (data pkts)
+tsi     = (w0 >> 22) & 3            # bits 8-9   integer-timestamp mode
+tsf     = (w0 >> 20) & 3            # bits 10-11 fractional-timestamp mode
+counter = (w0 >> 16) & 0xF
+psize   =  w0 & 0xFFFF              # 32-bit words incl. header
+
+has_stream_id = ptype in (1, 3, 4, 5)   # Sceptre uses 1 & 4; both carry a Stream ID
+off = 4
+if has_stream_id:
+    stream_id = int.from_bytes(b[off:off+4], "big"); off += 4
+class_id = None
+if has_cid:
+    class_id = b[off:off+8]; off += 8        # OUI + class codes, BEFORE the timestamps
+int_ts = frac_ps = None
+if tsi:
+    int_ts  = int.from_bytes(b[off:off+4], "big"); off += 4
+if tsf:
+    frac_ps = int.from_bytes(b[off:off+8], "big"); off += 8
+header_len = off                              # 20 (default) or 28 (class_id set)
+timestamp  = (int_ts or 0) + (frac_ps or 0) / 1e12
+```
+*The `Header` dataclass carries `header_len`, `has_trailer`, `class_id`, `int_ts`, `frac_ps`, `timestamp`, plus the existing fields (`packet_type`, `counter`, `packet_size`, `stream_id`). Keep presence flag-/type-driven, never a magic constant.*
+
+*`decode_context(b, hdr)`: the 32-bit CIF now begins at `hdr.header_len` (was `20 + 8`). Everything after it — the descending `FIELD_SIZE` walk, the fixed-point conversions, and the Data-Packet-Payload-Format decode yielding `bytes_per_sample`/`is_complex` — is unchanged.*
+
+*`trim_data(b, hdr, bytes_per_sample)`: `start = hdr.header_len`; `end = len(b) - (4 if hdr.has_trailer else 0)`; `body = b[start:end]`; `num_samples = len(body) // bytes_per_sample`; return `(body[:num_samples*bytes_per_sample], num_samples)`. Cross-check `len(b) == hdr.packet_size * 4` and log a mismatch. Do NOT reintroduce `floor((packet_size*4 - 20)/bps)`.*
+
+*Keep `bytes_per_sample`/`is_complex` sourced dynamically from the context Data-Payload-Format field (already implemented in Stage 2). Leave the "must be complex float32 / 8 bytes" check as a loud assertion, but isolate it so a future RAW/real-float Sceptre stream can relax it without touching the trim math ("dynamic payload").*
+
+*Part B — buffer flush contract (spec + guard). Amend the Stage 3 requirements: `IngestBuffer.flush()` resets `_chunks`, `_num_samples`, `_start_timestamp`, `_first_arrival` and MUST keep `_current_context`. Data is dropped ONLY when `_current_context is None` (cold start, before the first context packet). No flush trigger — size, real-context-change, age, or gap — may set `_current_context = None`. This guarantees that after a size/age/gap flush, the very next data packet is accepted immediately under the retained context and its window is contiguous in sample time (no "waiting for a context packet" gap). Write `tests/test_buffer_flush_contract.py` with `buffer = pytest.importorskip("sceptre_pipeline.buffer")` so it self-activates once Stage 3 lands: force a size-triggered flush, then push a data record and assert (a) it is accumulated, not dropped; (b) a subsequent flush emits it under the still-latched context; (c) its window's `start_timestamp` equals that data packet's own timestamp.*
+
+**Acceptance criteria.**
+- **Recording header (C=1, T=1):** `parse_header` on a real data packet → `header_len=28`, `has_trailer=True`, `class_id=00fffffa00160000`, `int_ts=1782443209` (`2026-06-26`), `frac_ps` increasing by `1_632_000_000` per packet; `timestamp`/`start_timestamp` is a real 2026 instant, **not** 1970.
+- **Default header (C=0, T=0):** on synthetic bytes with `class_id`/`trailer` cleared and a 20-byte header, `parse_header` → `header_len=20`, `has_trailer=False`, timestamps read at offsets 8/12 — same code path, no special-casing.
+- **Context/trim still correct on recordings:** BW=500000.0, RF=97300000.0 → 103700000.0, SR=625000.0, `is_complex=True`, `bytes_per_sample=8`; data trims to exactly **1020** samples, `len(body) % 8 == 0`, no garbage first sample.
+- **Offsets are flag-driven:** flipping `class_id` or `trailer` in synthetic bytes shifts `header_len` / `payload_end` accordingly; grep shows no offset hardcoded to `20` or `28` in the parse path.
+- **Buffer flush contract:** `test_buffer_flush_contract.py` passes once `buffer.py` exists (and skips cleanly until then) — a post-flush data packet is accepted, emitted under the retained context, with a contiguous `start_timestamp`; no trigger nulls `_current_context`.
+- Full suite green: `pytest` (existing Stage 0–2 tests updated to dynamic offsets, all passing).
+
+---
+
 ## Stage 3 — Ingest buffer (routing, accumulation, four flush triggers, single conversion)
 
 **Objective.** Route per-packet records into accumulated byte-chunks + a context dict; flush on four triggers; convert once. Implement all four correctness gotchas exactly.
