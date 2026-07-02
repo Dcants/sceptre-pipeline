@@ -136,24 +136,28 @@ class ReplaySource(PacketSource):
             self._thread.join(timeout=_JOIN_TIMEOUT_S)
 
     def _run(self) -> None:
-        # pickle is safe here: only locally produced captures with the fixed
-        # recorder schema are replayed (see recorder module docstring).
-        with self._path.open("rb") as file:
-            capture = pickle.load(file)
-        packets = capture["packets"]
+        try:
+            # pickle is safe here: only locally produced captures with the fixed
+            # recorder schema are replayed (see recorder module docstring).
+            with self._path.open("rb") as file:
+                capture = pickle.load(file)
+            packets = capture["packets"]
 
-        prev_ts_ns: int | None = None
-        for packet in packets:
-            if self._stop.is_set():
-                break
-            ts_ns = packet[0]
-            if self._pace and prev_ts_ns is not None:
-                delta_s = (ts_ns - prev_ts_ns) / 1e9
-                # Event.wait doubles as an interruptible sleep
-                if delta_s > 0 and self._stop.wait(delta_s):
+            prev_ts_ns: int | None = None
+            for packet in packets:
+                if self._stop.is_set():
                     break
-            prev_ts_ns = ts_ns
-            self._raw_queue.put(packet[3])
-
-        # always signal end-of-stream so Thread B flushes and exits
-        self._raw_queue.put(SHUTDOWN)
+                ts_ns = packet[0]
+                if self._pace and prev_ts_ns is not None:
+                    delta_s = (ts_ns - prev_ts_ns) / 1e9
+                    # Event.wait doubles as an interruptible sleep
+                    if delta_s > 0 and self._stop.wait(delta_s):
+                        break
+                prev_ts_ns = ts_ns
+                self._raw_queue.put(packet[3])
+        except Exception:
+            logger.exception("ReplaySource failed replaying %s", self._path)
+        finally:
+            # ALWAYS signal end-of-stream — even on a bad/corrupt capture —
+            # so Thread B flushes and exits instead of polling forever.
+            self._raw_queue.put(SHUTDOWN)

@@ -81,6 +81,26 @@ def test_replay_pace_sleeps_are_interrupted_by_stop(tmp_path) -> None:
     assert time.monotonic() - t0 < 10.0
 
 
+def test_replay_missing_or_corrupt_capture_still_signals_shutdown(
+    tmp_path, caplog
+) -> None:
+    """A dead source thread must never leave the consumer polling forever."""
+    corrupt = tmp_path / "corrupt.pkl"
+    corrupt.write_bytes(b"this is not a pickle")
+
+    for bad_path in (tmp_path / "missing.pkl", corrupt):
+        q = BoundedRawQueue(maxsize=8)
+        source = ReplaySource(bad_path, q, threading.Event())
+        with caplog.at_level(logging.ERROR, logger="sceptre_pipeline.sources"):
+            source.start()
+            assert q.get(timeout=2.0) is SHUTDOWN, f"no SHUTDOWN for {bad_path.name}"
+        source.stop()
+
+    assert sum(
+        "failed replaying" in record.getMessage() for record in caplog.records
+    ) == 2
+
+
 # --- Recorder --------------------------------------------------------------
 
 
