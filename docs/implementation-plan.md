@@ -318,4 +318,3 @@ timestamp  = (int_ts or 0) + (frac_ps or 0) / 1e12
 2. `python -m sceptre_pipeline --replay recordings/single_frequency.pkl` — observe steady-state emits at RF 97.3 MHz / SR 625 kHz; total ≈ 3,127,320 samples; clean exit.
 3. `python -m sceptre_pipeline --replay recordings/change_frequency.pkl` — observe the 97.3 → 103.7 MHz transition with the old-context-labeled boundary window.
 4. `python receiver/recieve_udp.py --duration 2` (or loopback sender) — confirm captures land in `recordings/` and reload; confirm `LiveSource` fan-out records while the live path stays lossy/bounded.
-5. Ground truth: the two recordings are authoritative; any decode disagreeing with BW=500k / RF=97.3M→103.7M / SR=625k / 1020 samples-per-packet is a bug.
