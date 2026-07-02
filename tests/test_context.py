@@ -49,7 +49,7 @@ def test_real_cif_word_and_context_count(single_frequency_path, load_capture) ->
     decoded = []
     for raw in contexts:
         hdr = parse_header(raw)
-        cif = struct.unpack_from(">I", raw, 20 + (8 if hdr.class_id else 0))[0]
+        cif = struct.unpack_from(">I", raw, hdr.header_len)[0]
         assert cif == 0x28208000  # present bits [29, 27, 21, 15]
         decoded.append(decode_context(raw, hdr))
     # periodic context is identical — Stage 3 must NOT flush on it

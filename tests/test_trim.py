@@ -1,8 +1,9 @@
-"""Stage 2: data trim (C1/C2/C3), counter-gap detection, data-before-context.
+"""Stage 2/2.5: data trim (flag-driven bounds), counter-gap detection,
+data-before-context.
 
 Trim math must come from the trimmed body length (1020 samples), never the
-PDF formula floor((packet_size*4 - 20)/8) = 1021, which injects the id-word
-as a garbage first sample.
+PDF formula floor((packet_size*4 - 20)/8) = 1021, which injects the tail of
+the header as a garbage first sample.
 """
 
 from __future__ import annotations
@@ -47,7 +48,7 @@ def test_real_data_packet_trims_to_1020_samples(
     assert len(body) % 8 == 0
     assert len(body) // 8 == 1020  # NOT the PDF's 1021
 
-    # no garbage first sample: id-word bytes excluded, values are sane IQ
+    # no garbage first sample: header bytes excluded, values are sane IQ
     components = np.frombuffer(body, dtype=">f4")
     assert components.size == 2040
     assert not np.isnan(components).any()
@@ -73,13 +74,13 @@ def test_all_real_data_packets_trim_cleanly(single_frequency_path, load_capture)
 # --- synthetic trim arithmetic ----------------------------------------------
 
 
-def test_trim_synthetic_complex_float32_drops_idword_and_trailer() -> None:
+def test_trim_synthetic_complex_float32_drops_header_and_trailer() -> None:
     samples = [complex(1.0, -1.0), complex(0.5, 0.25), complex(-2.0, 3.0)]
     raw = build_data_packet(payload=encode_iq_float32(samples))
     hdr = parse_header(raw)
     body, num_samples = trim_data(raw, hdr, bytes_per_sample=8)
     assert num_samples == 3
-    assert body == encode_iq_float32(samples)  # id-word and \xAA trailer gone
+    assert body == encode_iq_float32(samples)  # 28B header and \xAA trailer gone
 
 
 def test_trim_sub_32bit_format_pads_are_floored_away() -> None:
@@ -115,7 +116,7 @@ def test_trim_handles_every_flag_combination(class_id: bool, trailer: bool) -> N
     payload = encode_iq_float32([complex(1, 2), complex(-3, 4)])
     raw = build_data_packet(payload=payload, class_id=class_id, trailer=trailer)
     hdr = parse_header(raw)
-    assert hdr.class_id is class_id and hdr.trailer is trailer
+    assert (hdr.class_id is not None) is class_id and hdr.has_trailer is trailer
     body, num_samples = trim_data(raw, hdr, bytes_per_sample=8)
     assert num_samples == 2
     assert body == payload
