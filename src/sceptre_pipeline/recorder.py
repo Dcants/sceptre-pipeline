@@ -19,6 +19,14 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_LIVE_RECORD_MAX_BYTES = 512 * 1024 * 1024
+"""Default hard cap for indefinite live ``--record`` sessions (Stage 4 CLI).
+
+An open-ended live session must not grow memory without limit, so the CLI
+constructs its Recorder with this cap unless a flag overrides it.
+Duration-bounded captures (``receiver/recieve_udp.py``) may keep the
+unbounded default."""
+
 
 def default_recording_path(root: Path | str) -> Path:
     """Return ``root/recordings/udp_capture_<timestamp>.pkl``, creating the dir."""
