@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import pickle
 import socket
+import sys
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -95,7 +96,9 @@ class LiveSource(PacketSource):
         """
         try:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, self._rcvbuf_bytes)
-        except OSError as exc:
+        except (OSError, OverflowError, TypeError) as exc:
+            # CPython raises TypeError/OverflowError (not OSError) for values
+            # outside C-int range (>= 2**31)
             logger.warning(
                 "could not set SO_RCVBUF to %d: %s", self._rcvbuf_bytes, exc
             )
@@ -104,7 +107,12 @@ class LiveSource(PacketSource):
             granted = sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
         except OSError as exc:
             logger.warning("could not read back SO_RCVBUF: %s", exc)
-        if granted is not None and granted < self._rcvbuf_bytes:
+        # Linux getsockopt reports DOUBLE the effective buffer, so an honored
+        # request reads back as 2x; other platforms echo the set value.
+        honored_floor = self._rcvbuf_bytes * (
+            2 if sys.platform.startswith("linux") else 1
+        )
+        if granted is not None and granted < honored_floor:
             logger.warning(
                 "SO_RCVBUF clamped: requested %d, granted %d "
                 "(on Linux, raise net.core.rmem_max to honor the request)",

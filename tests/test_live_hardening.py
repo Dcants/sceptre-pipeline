@@ -72,7 +72,8 @@ def test_default_rcvbuf_is_multi_mib() -> None:
     assert DEFAULT_RCVBUF_BYTES >= 4 * 1024 * 1024
 
 
-def test_rcvbuf_option_applied_and_granted_size_logged(caplog) -> None:
+def test_rcvbuf_option_applied_and_granted_size_logged(caplog, monkeypatch) -> None:
+    monkeypatch.setattr(sys, "platform", "win32")  # echo semantics match FakeSocket
     source = _live_source(rcvbuf_bytes=123_456)
     sock = FakeSocket()
 
@@ -115,6 +116,59 @@ def test_rcvbuf_clamped_below_request_warns(caplog) -> None:
     assert warnings, "clamped SO_RCVBUF did not log a warning"
     message = warnings[0].getMessage().replace(",", "").replace("_", "")
     assert "8388608" in message and "416768" in message
+
+
+def test_rcvbuf_huge_value_never_kills_source(caplog) -> None:
+    """CPython setsockopt raises TypeError (not OSError) for values >= 2**31;
+    the source must warn and keep running, and ready must still fire."""
+    stop = threading.Event()
+    source = LiveSource(
+        "127.0.0.1",
+        0,
+        BoundedRawQueue(maxsize=64),
+        stop,
+        rcvbuf_bytes=2 * 1024 * 1024 * 1024,
+    )
+    with caplog.at_level(logging.WARNING, logger=SOURCES_LOGGER):
+        source.start()
+        try:
+            assert source.ready.wait(2.0), "huge rcvbuf request killed the source"
+            assert source.bound_address is not None
+        finally:
+            source.stop()
+
+    assert any("SO_RCVBUF" in r.getMessage() for r in caplog.records)
+
+
+def test_rcvbuf_linux_doubled_readback_clamp_detected(caplog, monkeypatch) -> None:
+    """Linux getsockopt reports DOUBLE the effective buffer: a clamp at
+    rmem_max in [request/2, request) reads back >= request and must still warn."""
+    monkeypatch.setattr(sys, "platform", "linux")
+    source = _live_source(rcvbuf_bytes=8 * 1024 * 1024)
+    sock = FakeSocket(granted=12_582_912)  # 2 * 6 MiB: effective 6 MiB < 8 MiB
+
+    with caplog.at_level(logging.WARNING, logger=SOURCES_LOGGER):
+        source._configure_rcvbuf(sock)
+
+    assert any(
+        r.levelno == logging.WARNING and "SO_RCVBUF" in r.getMessage()
+        for r in caplog.records
+    ), "doubled-readback clamp went unwarned"
+
+
+def test_rcvbuf_linux_honored_doubled_readback_logs_info(caplog, monkeypatch) -> None:
+    monkeypatch.setattr(sys, "platform", "linux")
+    source = _live_source(rcvbuf_bytes=8 * 1024 * 1024)
+    sock = FakeSocket(granted=16_777_216)  # 2 * 8 MiB: request fully honored
+
+    with caplog.at_level(logging.INFO, logger=SOURCES_LOGGER):
+        source._configure_rcvbuf(sock)
+
+    assert not any(r.levelno == logging.WARNING for r in caplog.records)
+    assert any(
+        r.levelno == logging.INFO and "SO_RCVBUF" in r.getMessage()
+        for r in caplog.records
+    )
 
 
 def test_rcvbuf_getsockopt_failure_survives(caplog) -> None:
