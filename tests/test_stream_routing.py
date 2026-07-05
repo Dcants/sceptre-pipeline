@@ -136,7 +136,16 @@ def test_single_stream_recording_is_the_n1_case(
 # --- spoofed-stream flood is bounded by max_streams ------------------------------
 
 
-def test_stream_flood_bounded_by_max_streams(caplog) -> None:
+def test_max_streams_defaults_to_64() -> None:
+    from sceptre_pipeline.interpreter import DEFAULT_MAX_STREAMS
+
+    assert DEFAULT_MAX_STREAMS == 64
+    assert Interpreter().max_streams == 64
+
+
+def test_context_flood_bounded_by_max_streams(caplog) -> None:
+    """Spoofed CONTEXT packets are the memory-growth threat: each decoded
+    context claims a tracked-stream slot, so slots are capped."""
     interp = Interpreter(max_streams=4)
     for sid in range(4):
         interp.process(
@@ -147,13 +156,15 @@ def test_stream_flood_bounded_by_max_streams(caplog) -> None:
         for sid in range(1000, 1200):  # 200 spoofed stream ids
             assert (
                 interp.process(
-                    build_data_packet(payload=FLOAT_PAYLOAD, stream_id=sid)
+                    build_context_packet(
+                        fields=standard_context_fields(), stream_id=sid
+                    )
                 )
                 is None
             )
 
     assert interp.dropped == 200  # dropped-and-counted, never folded
-    assert len(interp._contexts) <= 4
+    assert len(interp._contexts) == 4
     assert len(interp._last_counter) <= 4
     flood_logs = [r for r in caplog.records if "max_streams" in r.getMessage()]
     assert 1 <= len(flood_logs) <= 5  # rate-limited, not one line per packet
@@ -161,6 +172,43 @@ def test_stream_flood_bounded_by_max_streams(caplog) -> None:
     # the tracked streams still flow normally after the flood
     r = interp.process(build_data_packet(payload=FLOAT_PAYLOAD, stream_id=2))
     assert r["type"] == "data"
+
+
+def test_data_flood_on_unknown_streams_creates_no_state() -> None:
+    """DATA packets on never-contexted streams are dropped without creating
+    ANY per-stream state — garbage headers wearing random stream_ids cannot
+    consume max_streams slots and lock out later legitimate streams."""
+    interp = Interpreter(max_streams=4)
+    for sid in range(2000, 2200):  # 200 unknown stream ids
+        assert (
+            interp.process(build_data_packet(payload=FLOAT_PAYLOAD, stream_id=sid))
+            is None
+        )
+    assert interp.dropped == 200
+    assert interp._contexts == {}
+    assert interp._last_counter == {}
+
+    # a legitimate NEW stream arriving after the flood is admitted normally
+    interp.process(build_context_packet(fields=standard_context_fields(), stream_id=1))
+    r = interp.process(build_data_packet(payload=FLOAT_PAYLOAD, stream_id=1))
+    assert r["type"] == "data"
+
+
+def test_failed_context_decode_never_consumes_a_slot() -> None:
+    """A datagram must actually DECODE as a context before its stream_id can
+    claim one of the max_streams slots."""
+    interp = Interpreter(max_streams=2)
+    interp.process(build_context_packet(fields=standard_context_fields(), stream_id=1))
+
+    for sid in range(3000, 3050):  # 50 truncated contexts on distinct streams
+        bad = build_context_packet(fields=standard_context_fields(), stream_id=sid)
+        assert interp.process(bad[:30]) is None  # header ok, CIF missing
+    assert interp.errors == 50
+    assert len(interp._contexts) == 1  # no slot consumed by garbage
+
+    # the second real stream still gets the remaining slot
+    interp.process(build_context_packet(fields=standard_context_fields(), stream_id=2))
+    assert interp.context_for(2) is not None
 
 
 def test_flooded_new_context_is_also_bounded() -> None:

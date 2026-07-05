@@ -137,6 +137,49 @@ def test_undersized_datagram_dropped_and_counted_not_short_read() -> None:
     assert _counts(interp) == (1, 0)  # truncation surfaces as a caught error
 
 
+def test_truncated_packet_does_not_erase_the_gap_signal() -> None:
+    """A dropped-for-truncation packet must NOT advance _last_counter: the
+    next good packet has to flag the discontinuity, or the buffer would
+    stitch across the missing samples with no gap flush."""
+    interp = _primed()
+    r0 = interp.process(build_data_packet(payload=ONE_SAMPLE, counter=0))
+    assert r0["metadata"]["gap_before"] is False
+
+    lost = build_data_packet(payload=ONE_SAMPLE, counter=1)
+    assert interp.process(lost[:-6]) is None  # counter 1 truncated -> dropped
+
+    r2 = interp.process(build_data_packet(payload=ONE_SAMPLE, counter=2))
+    assert r2["metadata"]["gap_before"] is True  # 0 -> 2: gap survives
+
+
+def test_oversized_context_datagram_never_decodes_trailing_bytes() -> None:
+    """The CIF walk is bounded by the DECLARED packet size: glued trailing
+    bytes must not be readable as context fields."""
+    interp = Interpreter()
+    good = build_context_packet(fields=standard_context_fields())
+    record = interp.process(good + b"\xde\xad\xbe\xef" * 8)
+    assert record["type"] == "context"  # trailing garbage ignored entirely
+    assert record["context"]["rf_hz"] == 97_300_000.0
+    assert record["context"]["bytes_per_sample"] == 8
+
+    # a context whose CIF claims a field beyond its declared end is dropped
+    # as truncation even when the DATAGRAM has bytes there (glued packet)
+    forged = bytearray(good)
+    hdr_words = struct.unpack(">I", good[:4])[0] & 0xFFFF
+    forged[2:4] = (hdr_words - 2).to_bytes(2, "big")  # declare 8 bytes fewer
+    assert interp.process(bytes(forged) + b"\x00" * 64) is None
+    assert interp.errors == 1
+
+
+def test_non_bytes_input_is_caught_by_the_guard() -> None:
+    """The never-propagate guard must itself never raise — not even on a
+    stray non-bytes queue item (no __len__)."""
+    interp = _primed()
+    for junk in (None, 12345, object()):
+        assert interp.process(junk) is None
+    assert _counts(interp) == (3, 0)
+
+
 # --- rate-limited logging --------------------------------------------------------
 
 
@@ -186,6 +229,11 @@ def test_random_datagram_stress_keeps_interpreter_alive(caplog) -> None:
 
     # the log stayed bounded (rate-limited), nowhere near one line per datagram
     assert len(caplog.records) < 120
+
+    # and the per-stream maps stayed bounded: garbage headers wearing random
+    # stream_ids never created tracked-stream state
+    assert len(interp._contexts) <= interp.max_streams
+    assert len(interp._last_counter) <= len(interp._contexts)
 
     # and the interpreter still works afterwards
     follow_up = interp.process(build_data_packet(payload=ONE_SAMPLE, counter=0))

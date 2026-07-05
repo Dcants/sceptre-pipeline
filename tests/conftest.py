@@ -45,6 +45,21 @@ def _load_capture(path: Path | str) -> dict:
         return pickle.load(file)
 
 
+@pytest.fixture(autouse=True)
+def _fresh_module_rate_limits(monkeypatch):
+    """Reset interpreter-module log-rate-limiter state before every test.
+
+    The limiter state is process-global by design (live runtime); without a
+    reset, caplog assertions would depend on how many earlier tests already
+    consumed a reason's first-N budget — i.e. on test file ordering.
+    """
+    from sceptre_pipeline import interpreter
+
+    monkeypatch.setattr(interpreter, "_module_log", interpreter._RateLimitedLog())
+    monkeypatch.setattr(interpreter, "_UNSUPPORTED_WORDS_LOGGED", set())
+    monkeypatch.setattr(interpreter, "_unsupported_cap_announced", False)
+
+
 @pytest.fixture
 def recordings_dir() -> Path:
     return RECORDINGS_DIR

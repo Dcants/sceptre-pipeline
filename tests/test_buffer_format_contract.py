@@ -144,7 +144,9 @@ def test_unsupported_context_leaves_buffer_inert_until_supported() -> None:
     buf.flush()  # must not emit and must not crash on np.dtype(None)
     assert len(emitted) == 1
 
-    # a supported context re-enables flow
+    # a supported context re-enables flow — and the re-enabled window holds
+    # ONLY the post-re-enable samples: had the buffer silently accumulated
+    # the rogue bytes instead of staying inert, they would surface here
     _push_context(buf, interp, REAL_INT16, counter=4)
     buf.push(
         interp.process(build_data_packet(payload=INT16_PAYLOAD, counter=5, int_ts=400))
@@ -152,6 +154,8 @@ def test_unsupported_context_leaves_buffer_inert_until_supported() -> None:
     buf.flush()
     assert len(emitted) == 2
     assert emitted[1]["metadata"]["component_dtype"] == ">i2"
+    assert emitted[1]["num_samples"] == 4  # 8 bytes / 2 B — no rogue leak
+    assert emitted[1]["start_timestamp"] == 400.0
 
 
 def test_every_emitted_unit_carries_format_metadata() -> None:

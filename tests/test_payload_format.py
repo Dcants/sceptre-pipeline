@@ -32,6 +32,10 @@ RETURN_KEYS = {
     "component_bits",  # legacy Stage 2 alias of item_bits
     "event_tag",
     "channel_tag",
+    "sample_component_repeat",
+    "fraction_size",
+    "repeat_count",
+    "vector_size",
     "component_dtype",
     "bytes_per_sample",
     "supported",
@@ -115,6 +119,11 @@ UNSUPPORTED_WORDS = {
     "float32-code-odd-bits": encode_payload_format_u64(
         packing_bits=64, item_bits=64  # float32 code with 64-bit items
     ),
+    # non-default framing fields change the payload layout: never guess
+    "sample-component-repeat": encode_payload_format_u64() | (1 << 55),
+    "fraction-size": encode_payload_format_u64() | (0b0110 << 44),
+    "repeat-count": encode_payload_format_u64() | (3 << 16),
+    "vector-size": encode_payload_format_u64() | 15,
 }
 
 

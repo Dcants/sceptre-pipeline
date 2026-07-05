@@ -214,10 +214,14 @@ def decode_payload_format(u: int) -> dict[str, Any]:
     packing_method = (u >> 63) & 1
     rc_type = (u >> 61) & 0b11
     data_item_format = (u >> 56) & 0x1F
+    sample_component_repeat = (u >> 55) & 1
     event_tag = (u >> 52) & 0x7
     channel_tag = (u >> 48) & 0xF
+    fraction_size = (u >> 44) & 0xF  # Data Item Fraction Size
     item_packing_bits = ((u >> 38) & 0x3F) + 1  # Item Packing Field Size - 1
     item_bits = ((u >> 32) & 0x3F) + 1  # Data Item Size - 1
+    repeat_count = (u >> 16) & 0xFFFF  # stored as N-1; 0 = no repetition
+    vector_size = u & 0xFFFF  # stored as N-1; 0 = scalar items
 
     # (format, bits) membership in ITEM_FORMAT_DTYPES implies both
     # data_item_format in SUPPORTED_ITEM_FORMATS and item_bits in
@@ -231,6 +235,12 @@ def decode_payload_format(u: int) -> dict[str, Any]:
         and item_packing_bits == item_bits  # no in-container padding
         and event_tag == 0
         and channel_tag == 0
+        # any non-default framing field changes the payload layout in ways
+        # this decoder does not implement — classify unsupported, never guess
+        and sample_component_repeat == 0
+        and fraction_size == 0
+        and repeat_count == 0
+        and vector_size == 0
     )
     is_complex = rc_type == RC_TYPE_COMPLEX_CARTESIAN
     bytes_per_sample: int | None
@@ -250,6 +260,10 @@ def decode_payload_format(u: int) -> dict[str, Any]:
         "component_bits": item_bits,  # legacy Stage 2 name
         "event_tag": event_tag,
         "channel_tag": channel_tag,
+        "sample_component_repeat": sample_component_repeat,
+        "fraction_size": fraction_size,
+        "repeat_count": repeat_count,
+        "vector_size": vector_size,
         "component_dtype": component_dtype,
         "bytes_per_sample": bytes_per_sample,
         "supported": supported,
@@ -270,9 +284,15 @@ def decode_context(b: bytes, hdr: Header) -> dict[str, Any]:
     decoded from higher bits. Truncation raises ValueError — the Interpreter's
     process() guard catches it and counts it on ``errors``.
     """
+    # never read past the DECLARED packet end: an oversized datagram (glued
+    # packets / jumbo frame) must not have its trailing bytes decoded as
+    # context fields, mirroring trim_data's bound on the data path
+    end_limit = min(len(b), hdr.packet_size * 4)
     offset = hdr.header_len
-    if len(b) < offset + 4:
-        raise ValueError(f"context packet truncated before CIF: {len(b)} bytes")
+    if end_limit < offset + 4:
+        raise ValueError(
+            f"context packet truncated before CIF: {end_limit} usable bytes"
+        )
     cif = struct.unpack_from(">I", b, offset)[0]
     offset += 4
 
@@ -293,10 +313,10 @@ def decode_context(b: bytes, hdr: Header) -> dict[str, Any]:
                     len(ctx),
                 )
             break
-        if offset + size > len(b):
+        if offset + size > end_limit:
             raise ValueError(
                 f"context packet truncated inside CIF bit {bit} field "
-                f"({len(b) - offset} of {size} bytes)"
+                f"({end_limit - offset} of {size} bytes)"
             )
         field = b[offset : offset + size]
         if bit == CIF_BANDWIDTH:
@@ -332,6 +352,13 @@ def trim_data(b: bytes, hdr: Header, bytes_per_sample: int) -> tuple[bytes, int]
     a shorter one raises ValueError (truncation — caught by the process()
     guard) rather than silently short-reading. Purity matters: format
     supportedness lives in ``decode_payload_format``, never here.
+
+    Known limitation (deferred): for sub-32-bit formats whose word-alignment
+    pad is a multiple of ``bytes_per_sample`` (e.g. one pad word of int8
+    samples), the length-floor rule cannot distinguish pad from samples —
+    resolving that needs the VITA-49 trailer's pad-bit count, which no
+    available capture exercises. Complex-float32 (the verified format) is
+    unaffected: its samples are whole words.
     """
     declared = hdr.packet_size * 4
     if len(b) < declared:
@@ -373,9 +400,11 @@ class Interpreter:
         self.max_streams = max_streams
         self.errors = 0  # datagrams dropped because parsing raised
         self.dropped = 0  # datagrams dropped by policy
+        # _contexts is the tracked-stream set (bounded by max_streams);
+        # _last_counter only ever holds streams that produced data records
+        # under a decoded context, so it is a subset of _contexts' keys
         self._contexts: dict[int, dict[str, Any]] = {}
         self._last_counter: dict[int, int] = {}
-        self._streams: set[int] = set()  # admitted ids; bounds both maps
         self._log = _RateLimitedLog()
 
     def context_for(self, stream_id: int) -> dict[str, Any] | None:
@@ -388,8 +417,14 @@ class Interpreter:
         except Exception as exc:
             self.errors += 1
             if self._log.should_log("unparseable"):
+                # the guard itself must never raise: raw may not even be
+                # bytes (a stray queue item), so size it defensively
+                try:
+                    size = len(raw)
+                except TypeError:
+                    size = -1
                 logger.warning(
-                    "dropping unparseable datagram (%d bytes): %s", len(raw), exc
+                    "dropping unparseable datagram (%d bytes): %s", size, exc
                 )
             return None
 
@@ -404,10 +439,17 @@ class Interpreter:
                 )
             return None
 
-        # types 1 and 4 always carry a stream_id; bound the per-stream maps
+        # types 1 and 4 always carry a stream_id
         stream_id = hdr.stream_id
-        if stream_id not in self._streams:
-            if len(self._streams) >= self.max_streams:
+
+        if hdr.packet_type == PACKET_TYPE_IF_CONTEXT:
+            # a stream is tracked only once one of its contexts DECODES: a
+            # garbage datagram that merely wears a plausible header can never
+            # consume one of the max_streams slots and lock out real streams
+            if (
+                stream_id not in self._contexts
+                and len(self._contexts) >= self.max_streams
+            ):
                 self.dropped += 1
                 if self._log.should_log("stream-flood"):
                     logger.warning(
@@ -417,10 +459,7 @@ class Interpreter:
                         self.max_streams,
                     )
                 return None
-            self._streams.add(stream_id)
-
-        if hdr.packet_type == PACKET_TYPE_IF_CONTEXT:
-            ctx = decode_context(raw, hdr)
+            ctx = decode_context(raw, hdr)  # raises -> guard; no slot consumed
             # an unsupported context is still adopted and emitted: downstream
             # must know the stream is present-but-unsupported
             self._contexts[stream_id] = ctx
@@ -431,6 +470,9 @@ class Interpreter:
                 "data": None,
             }
 
+        # data path: a stream with no decoded context yet has NO per-stream
+        # state at all, so foreign/spoofed data floods cannot grow memory —
+        # _last_counter is only ever written below, after a context exists
         ctx = self._contexts.get(stream_id)
         if ctx is None:  # startup: no context for THIS stream yet
             self.dropped += 1
@@ -451,6 +493,11 @@ class Interpreter:
                 )
             return None
 
+        # trim BEFORE recording the counter: a truncated packet that raises
+        # here is dropped, and the NEXT packet must still see the counter
+        # discontinuity (gap_before=True) — advancing _last_counter first
+        # would silently erase the gap signal for the missing samples
+        body, _num_samples = trim_data(raw, hdr, ctx["bytes_per_sample"])
         prev = self._last_counter.get(stream_id)
         gap_before = prev is not None and hdr.packet_counter != (prev + 1) % 16
         if gap_before and self._log.should_log("counter-gap"):
@@ -461,7 +508,6 @@ class Interpreter:
                 hdr.packet_counter,
             )
         self._last_counter[stream_id] = hdr.packet_counter
-        body, _num_samples = trim_data(raw, hdr, ctx["bytes_per_sample"])
         return {
             "type": "data",
             "metadata": self._metadata(hdr, ctx, gap_before=gap_before),
