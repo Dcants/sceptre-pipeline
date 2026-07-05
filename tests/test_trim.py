@@ -122,16 +122,32 @@ def test_trim_handles_every_flag_combination(class_id: bool, trailer: bool) -> N
     assert body == payload
 
 
-def test_trim_logs_packet_size_mismatch(caplog) -> None:
+# Stage 2.75 datagram-length hardening: an oversized datagram trims to
+# exactly packet_size*4 (no trailing bytes ingested as samples); an
+# under-length one raises (caught by the process() guard as truncation)
+# instead of silently short-reading.
+
+
+def test_trim_oversized_datagram_never_ingests_trailing_bytes(caplog) -> None:
     payload = encode_iq_float32([complex(1, 2), complex(3, 4)])
-    raw = build_data_packet(payload=payload)
-    # corrupt the size field: claim one word more than reality
-    hdr = parse_header(raw)
-    forged = raw[:2] + (hdr.packet_size + 1).to_bytes(2, "big") + raw[4:]
+    first = build_data_packet(payload=payload)
+    second = build_data_packet(payload=encode_iq_float32([complex(9, 9)]))
+    glued = first + second  # two concatenated packets in one datagram
+    hdr = parse_header(glued)  # word0 (and packet_size) of the FIRST packet
     with caplog.at_level(logging.WARNING, logger="sceptre_pipeline.interpreter"):
-        body, num_samples = trim_data(forged, parse_header(forged), bytes_per_sample=8)
-    assert num_samples == 2  # trim still derives from actual body length
+        body, num_samples = trim_data(glued, hdr, bytes_per_sample=8)
+    assert num_samples == 2
+    assert body == payload  # nothing of the second packet leaked in
     assert any("packet_size" in r.getMessage() for r in caplog.records)
+
+
+def test_trim_undersized_datagram_raises_instead_of_short_reading() -> None:
+    raw = build_data_packet(
+        payload=encode_iq_float32([complex(1, 2), complex(3, 4)])
+    )
+    truncated = raw[:-3]  # header intact, payload cut short
+    with pytest.raises(ValueError, match="truncated"):
+        trim_data(truncated, parse_header(truncated), bytes_per_sample=8)
 
 
 # --- Interpreter data path ----------------------------------------------------
@@ -161,7 +177,12 @@ def test_counter_wrap_15_to_0_is_not_a_gap() -> None:
 
 
 def test_counter_tracking_is_per_stream() -> None:
-    interp = _primed_interpreter()
+    # Stage 2.75: context is per-stream too, so prime both streams
+    interp = Interpreter()
+    for sid in (1, 2):
+        interp.process(
+            build_context_packet(fields=standard_context_fields(), stream_id=sid)
+        )
     payload = encode_iq_float32([complex(1, 1)])
     interp.process(build_data_packet(payload=payload, counter=3, stream_id=1))
     r = interp.process(build_data_packet(payload=payload, counter=9, stream_id=2))
