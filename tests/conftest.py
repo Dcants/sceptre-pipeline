@@ -45,6 +45,21 @@ def _load_capture(path: Path | str) -> dict:
         return pickle.load(file)
 
 
+@pytest.fixture(autouse=True)
+def _fresh_module_rate_limits(monkeypatch):
+    """Reset interpreter-module log-rate-limiter state before every test.
+
+    The limiter state is process-global by design (live runtime); without a
+    reset, caplog assertions would depend on how many earlier tests already
+    consumed a reason's first-N budget — i.e. on test file ordering.
+    """
+    from sceptre_pipeline import interpreter
+
+    monkeypatch.setattr(interpreter, "_module_log", interpreter._RateLimitedLog())
+    monkeypatch.setattr(interpreter, "_UNSUPPORTED_WORDS_LOGGED", set())
+    monkeypatch.setattr(interpreter, "_unsupported_cap_announced", False)
+
+
 @pytest.fixture
 def recordings_dir() -> Path:
     return RECORDINGS_DIR
@@ -72,10 +87,16 @@ def encode_payload_format_u64(
     data_item_format: int = 0b01110,  # IEEE-754 single float
     packing_bits: int = 32,
     item_bits: int = 32,
+    packing_method: int = 0,  # 1 = link-efficient (unsupported)
+    event_tag: int = 0,  # bits 54:52 (unsupported when nonzero)
+    channel_tag: int = 0,  # bits 51:48 (unsupported when nonzero)
 ) -> int:
     """Encode a Data Packet Payload Format word (Appendix A exact windows)."""
-    u = (real_complex_code & 0b11) << 61
+    u = (packing_method & 0b1) << 63
+    u |= (real_complex_code & 0b11) << 61
     u |= (data_item_format & 0x1F) << 56
+    u |= (event_tag & 0x7) << 52
+    u |= (channel_tag & 0xF) << 48
     u |= ((packing_bits - 1) & 0x3F) << 38
     u |= ((item_bits - 1) & 0x3F) << 32
     return u
