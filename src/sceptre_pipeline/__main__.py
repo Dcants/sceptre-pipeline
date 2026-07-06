@@ -1,0 +1,218 @@
+"""Stage 4 CLI: ``python -m sceptre_pipeline`` — replay a capture or go live.
+
+Wires the full pipeline (``BoundedRawQueue`` + ``Interpreter`` + per-stream
+``BufferRouter`` + a source), runs the Thread B loop on the main thread, and
+prints one demo line per emitted unit. Replay ends when the capture's SHUTDOWN
+sentinel drains through; live runs until Ctrl-C, which the main thread turns
+into a clean ``stop()`` + final flush inside ``Pipeline.run``'s ``finally``.
+
+``--replay`` XOR ``--live`` is a required mutually exclusive group, so argparse
+exits 2 on neither/both. The live ``--record`` path builds a BOUNDED Recorder
+(default cap ``recorder.DEFAULT_LIVE_RECORD_MAX_BYTES``) so an open-ended live
+session cannot grow memory without limit; the save path comes from
+``default_recording_path`` unless the user gives one.
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import threading
+import time
+from collections.abc import Sequence
+from pathlib import Path
+from typing import Any
+
+from .buffer import DEFAULT_FLUSH_FIELDS, BufferRouter
+from .interpreter import DEFAULT_MAX_STREAMS, Interpreter
+from .queues import BoundedRawQueue
+from .recorder import (
+    DEFAULT_LIVE_RECORD_MAX_BYTES,
+    Recorder,
+    default_recording_path,
+)
+from .runtime import Pipeline
+from .sources import LiveSource, ReplaySource
+
+logger = logging.getLogger(__name__)
+
+# One second of the known 625 kHz Sceptre stream is a sensible default window.
+DEFAULT_MAX_SAMPLES = 625_000
+DEFAULT_MAX_AGE_S = 1.0
+DEFAULT_QUEUE_SIZE = 4096
+DEFAULT_POLL_INTERVAL_S = 0.1
+
+
+def demo_emit(unit: dict[str, Any]) -> None:
+    """Print one line per emitted unit — the demo downstream consumer.
+
+    Reads context keys with ``.get()`` so a missing field prints ``None``
+    rather than raising: an exception here would propagate straight into the
+    Thread B loop.
+    """
+    context = unit.get("context") or {}
+    samples = unit["samples"]
+    print(
+        f"stream_id={unit['stream_id']} "
+        f"num_samples={unit['num_samples']} "
+        f"shape={tuple(samples.shape)} "
+        f"dtype={samples.dtype} "
+        f"rf_hz={context.get('rf_hz')} "
+        f"sample_rate_hz={context.get('sample_rate_hz')} "
+        f"start_timestamp={unit['start_timestamp']}"
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build the CLI parser (module-level so tests can exercise it directly)."""
+    parser = argparse.ArgumentParser(
+        prog="sceptre_pipeline",
+        description="Replay a Sceptre VITA-49 capture or ingest a live UDP stream.",
+    )
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument(
+        "--replay", metavar="PATH", help="replay a recorded .pkl capture"
+    )
+    mode.add_argument(
+        "--live", action="store_true", help="ingest a live UDP stream"
+    )
+
+    parser.add_argument(
+        "--pace",
+        action="store_true",
+        help="replay: pace playback by the recorded packet timing",
+    )
+    parser.add_argument(
+        "--host", default="0.0.0.0", help="live: bind host (default: %(default)s)"
+    )
+    parser.add_argument(
+        "--port", type=int, default=None, help="live: bind UDP port"
+    )
+    parser.add_argument(
+        "--record",
+        nargs="?",
+        const=True,
+        default=False,
+        metavar="PATH",
+        help="live: record the raw stream (optional output PATH; default: auto)",
+    )
+    parser.add_argument(
+        "--record-max-bytes",
+        type=int,
+        default=DEFAULT_LIVE_RECORD_MAX_BYTES,
+        help="live --record: hard byte cap (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--record-max-packets",
+        type=int,
+        default=None,
+        help="live --record: hard packet cap (default: none)",
+    )
+    parser.add_argument(
+        "--max-samples",
+        type=int,
+        default=DEFAULT_MAX_SAMPLES,
+        help="window size in samples (default: %(default)s = 1 s @ 625 kHz)",
+    )
+    parser.add_argument(
+        "--max-age-s",
+        type=float,
+        default=DEFAULT_MAX_AGE_S,
+        help="flush a partial window after this many seconds (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--max-streams",
+        type=int,
+        default=DEFAULT_MAX_STREAMS,
+        help="max concurrent stream_ids tracked (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--queue-size",
+        type=int,
+        default=DEFAULT_QUEUE_SIZE,
+        help="bounded raw-queue capacity (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--poll-interval",
+        type=float,
+        default=DEFAULT_POLL_INTERVAL_S,
+        help="Thread B dequeue poll interval, seconds (default: %(default)s)",
+    )
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Parse args, wire the pipeline, and run it to completion. Returns exit 0."""
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    stop = threading.Event()
+    raw_queue = BoundedRawQueue(maxsize=args.queue_size)
+    interpreter = Interpreter(max_streams=args.max_streams)
+    router = BufferRouter(
+        emit=demo_emit,
+        max_samples=args.max_samples,
+        max_age_s=args.max_age_s,
+        flush_fields=DEFAULT_FLUSH_FIELDS,  # never invent flush-field strings
+        max_streams=args.max_streams,
+    )
+
+    recorder: Recorder | None = None
+    record_path: Path | None = None
+    if args.live:
+        if args.port is None:
+            parser.error("--live requires --port")
+        if args.record is not False:
+            # bounded by default: an open-ended live session must stay bounded
+            recorder = Recorder(
+                max_bytes=args.record_max_bytes,
+                max_packets=args.record_max_packets,
+            )
+            record_path = (
+                Path(args.record)
+                if isinstance(args.record, str)
+                else default_recording_path(Path.cwd())
+            )
+        source: LiveSource | ReplaySource = LiveSource(
+            args.host, args.port, raw_queue, stop, recorder=recorder
+        )
+    else:
+        source = ReplaySource(args.replay, raw_queue, stop, pace=args.pace)
+
+    pipeline = Pipeline(
+        source,
+        raw_queue,
+        interpreter,
+        router,
+        stop,
+        poll_interval=args.poll_interval,
+    )
+
+    start_time_ns = time.time_ns()
+    try:
+        pipeline.run()
+    except KeyboardInterrupt:
+        # Ctrl-C on the main thread while run() blocks. run()'s finally has
+        # already unwound (flush + join + log); stop() just re-sets the Event.
+        logger.info("interrupted; shutting down")
+        pipeline.stop()
+
+    if recorder is not None and record_path is not None:
+        duration_s = (time.time_ns() - start_time_ns) / 1e9
+        saved = recorder.save(record_path, start_time_ns, duration_s)
+        logger.info(
+            "saved live recording to %s (%d packets, %d bytes, capped=%s)",
+            saved,
+            len(recorder),
+            recorder.total_bytes,
+            recorder.capped,
+        )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
