@@ -21,9 +21,9 @@ import threading
 import time
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
-from .buffer import DEFAULT_FLUSH_FIELDS, BufferRouter
+from .buffer import DEFAULT_FLUSH_FIELDS, BufferRouter, Emit
 from .interpreter import DEFAULT_MAX_STREAMS, Interpreter
 from .queues import BoundedRawQueue
 from .recorder import (
@@ -31,7 +31,7 @@ from .recorder import (
     Recorder,
     default_recording_path,
 )
-from .runtime import Pipeline
+from .runtime import DEFAULT_POLL_INTERVAL_S, Pipeline
 from .sources import LiveSource, ReplaySource
 
 logger = logging.getLogger(__name__)
@@ -40,7 +40,8 @@ logger = logging.getLogger(__name__)
 DEFAULT_MAX_SAMPLES = 625_000
 DEFAULT_MAX_AGE_S = 1.0
 DEFAULT_QUEUE_SIZE = 4096
-DEFAULT_POLL_INTERVAL_S = 0.1
+# DEFAULT_POLL_INTERVAL_S is imported from runtime so the CLI and library
+# defaults cannot drift.
 
 
 def demo_emit(unit: dict[str, Any]) -> None:
@@ -141,20 +142,29 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    """Parse args, wire the pipeline, and run it to completion. Returns exit 0."""
-    parser = build_parser()
-    args = parser.parse_args(argv)
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+class _Runtime(NamedTuple):
+    """The wired object graph a CLI run drives (factored out for testability)."""
 
+    pipeline: Pipeline
+    source: LiveSource | ReplaySource
+    recorder: Recorder | None
+    record_path: Path | None
+
+
+def _build_runtime(args: argparse.Namespace, emit: Emit = demo_emit) -> _Runtime:
+    """Wire queue + interpreter + router + source + Pipeline from parsed args.
+
+    Pure construction: ``main`` validates cross-flag preconditions (a live
+    ``--port``, a positive ``--poll-interval``) BEFORE calling this. Kept
+    module-level so a test can pin the real object graph — the tri-state
+    ``--record`` parse, the bounded ``Recorder``, and its attachment to the
+    ``LiveSource`` — without a subprocess.
+    """
     stop = threading.Event()
     raw_queue = BoundedRawQueue(maxsize=args.queue_size)
     interpreter = Interpreter(max_streams=args.max_streams)
     router = BufferRouter(
-        emit=demo_emit,
+        emit=emit,
         max_samples=args.max_samples,
         max_age_s=args.max_age_s,
         flush_fields=DEFAULT_FLUSH_FIELDS,  # never invent flush-field strings
@@ -163,9 +173,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     recorder: Recorder | None = None
     record_path: Path | None = None
+    source: LiveSource | ReplaySource
     if args.live:
-        if args.port is None:
-            parser.error("--live requires --port")
         if args.record is not False:
             # bounded by default: an open-ended live session must stay bounded
             recorder = Recorder(
@@ -177,7 +186,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if isinstance(args.record, str)
                 else default_recording_path(Path.cwd())
             )
-        source: LiveSource | ReplaySource = LiveSource(
+        source = LiveSource(
             args.host, args.port, raw_queue, stop, recorder=recorder
         )
     else:
@@ -191,6 +200,43 @@ def main(argv: Sequence[str] | None = None) -> int:
         stop,
         poll_interval=args.poll_interval,
     )
+    return _Runtime(pipeline, source, recorder, record_path)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Parse args, wire the pipeline, and run it. Returns 0 on success, 1 on
+    a source failure (bad replay / live bind failure), 2 on bad CLI args."""
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    # validate before constructing anything (parser.error exits 2)
+    if args.poll_interval <= 0:
+        parser.error("--poll-interval must be > 0")
+    if args.live and args.port is None:
+        parser.error("--live requires --port")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    runtime = _build_runtime(args)
+    pipeline = runtime.pipeline
+    source = runtime.source
+
+    # A live bind failure enqueues no SHUTDOWN and no Event, so run() would poll
+    # an empty queue forever. Watch source.ready off-thread; if the bind failed,
+    # stop the pipeline so run() unwinds. Pipeline stays source-agnostic.
+    bind_failed = threading.Event()
+    if args.live:
+
+        def _watch_bind() -> None:
+            source.ready.wait()  # type: ignore[union-attr]
+            if source.bound_address is None:  # type: ignore[union-attr]
+                bind_failed.set()
+                pipeline.stop()
+
+        threading.Thread(
+            target=_watch_bind, name="live-bind-watchdog", daemon=True
+        ).start()
 
     start_time_ns = time.time_ns()
     try:
@@ -201,6 +247,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         logger.info("interrupted; shutting down")
         pipeline.stop()
 
+    exit_code = 0
+    if bind_failed.is_set():
+        logger.error(
+            "live bind failed on %s:%s; exiting nonzero", args.host, args.port
+        )
+        exit_code = 1
+    elif source.failed:
+        logger.error("source failed; exiting nonzero")
+        exit_code = 1
+
+    recorder = runtime.recorder
+    record_path = runtime.record_path
     if recorder is not None and record_path is not None:
         duration_s = (time.time_ns() - start_time_ns) / 1e9
         saved = recorder.save(record_path, start_time_ns, duration_s)
@@ -211,7 +269,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             recorder.total_bytes,
             recorder.capped,
         )
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":

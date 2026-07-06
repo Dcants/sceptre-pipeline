@@ -12,6 +12,7 @@ thread is asserted finished; no test can block forever on a bug.
 
 from __future__ import annotations
 
+import logging
 import socket
 import threading
 import time
@@ -52,8 +53,31 @@ class _NoopSource(PacketSource):
         pass
 
 
+class _StopTrackingSource(PacketSource):
+    """A no-producing source that records whether ``stop()`` was called.
+
+    Stands in for a real source (whose ``stop()`` sets the Event and joins
+    Thread A) so a test can prove ``run()``'s finally joined the source even
+    when the final flush raised.
+    """
+
+    def __init__(self) -> None:
+        self.started = False
+        self.stopped = False
+
+    def start(self) -> None:
+        self.started = True
+
+    def stop(self) -> None:
+        self.stopped = True
+
+
 def _run_in_thread(pipeline: Pipeline) -> threading.Thread:
-    thread = threading.Thread(target=pipeline.run, name="pipeline-thread-B")
+    # daemon=True so a run()-hang regression can never wedge pytest at
+    # interpreter exit (matches sources.py's own thread convention)
+    thread = threading.Thread(
+        target=pipeline.run, name="pipeline-thread-B", daemon=True
+    )
     thread.start()
     return thread
 
@@ -197,7 +221,7 @@ def test_stop_event_path_flushes_final_window() -> None:
 # --- 5: defense-in-depth — a raising process() must not kill Thread B ------
 
 
-def test_process_exception_does_not_kill_thread_b() -> None:
+def test_process_exception_does_not_kill_thread_b(caplog) -> None:
     emitted: list = []
     stop = threading.Event()
     raw_queue = BoundedRawQueue(maxsize=64)
@@ -215,11 +239,20 @@ def test_process_exception_does_not_kill_thread_b() -> None:
     raw_queue.put(build_data_packet(payload=TWO_SAMPLES, counter=0))
     raw_queue.put(SHUTDOWN)
 
-    thread = _run_in_thread(pipeline)
-    thread.join(timeout=5.0)
+    with caplog.at_level(logging.WARNING, logger="sceptre_pipeline.runtime"):
+        thread = _run_in_thread(pipeline)
+        thread.join(timeout=5.0)
     assert not thread.is_alive(), "a raising process() hung / killed Thread B"
     assert interpreter.errors == 1, "the loop did not count the guarded failure"
     assert emitted == []
+    # H: the guarded drop must not be fully silent — it logs rate-limited,
+    # matching every other drop path's convention.
+    guard_warnings = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.WARNING and "process" in r.getMessage()
+    ]
+    assert guard_warnings, "the guarded process() failure was dropped silently"
 
 
 # --- 6: CLI (build_parser + main) -----------------------------------------
@@ -268,7 +301,7 @@ def test_main_replay_end_to_end(single_frequency_path, capsys) -> None:
             ["--replay", str(single_frequency_path), "--max-samples", "500000"]
         )
 
-    thread = threading.Thread(target=run, name="cli-main")
+    thread = threading.Thread(target=run, name="cli-main", daemon=True)
     thread.start()
     thread.join(timeout=JOIN_TIMEOUT_S)
     assert not thread.is_alive(), "main() hung on replay"
@@ -320,3 +353,241 @@ def test_live_loopback_smoke() -> None:
         pipeline.stop()
         thread.join(timeout=5.0)
     assert not thread.is_alive(), "run() did not join cleanly after stop()"
+
+
+# --- A: a raising final flush must still join Thread A ---------------------
+
+
+def test_flush_error_in_finally_still_stops_source() -> None:
+    """If an emit raises during the final flush_all, run() must still call
+    source.stop() (join Thread A) and re-raise — not leak the source thread."""
+    stop = threading.Event()
+    raw_queue = BoundedRawQueue(maxsize=64)
+    interpreter = Interpreter()
+
+    def boom_emit(_unit: dict) -> None:
+        raise RuntimeError("emit failed during the final flush")
+
+    # huge window + huge age => no flush during the loop; both streams' windows
+    # stay open until flush_all in run()'s finally, where boom_emit raises.
+    router = BufferRouter(emit=boom_emit, max_samples=1_000_000, max_age_s=1e9)
+    source = _StopTrackingSource()
+    pipeline = Pipeline(
+        source, raw_queue, interpreter, router, stop, poll_interval=0.02
+    )
+
+    for sid in (1, 2):
+        raw_queue.put(
+            build_context_packet(fields=standard_context_fields(), stream_id=sid)
+        )
+        raw_queue.put(build_data_packet(payload=TWO_SAMPLES, counter=0, stream_id=sid))
+    raw_queue.put(SHUTDOWN)
+
+    error: dict = {}
+
+    def run() -> None:
+        try:
+            pipeline.run()
+        except BaseException as exc:  # noqa: BLE001 - capture for assertion
+            error["exc"] = exc
+
+    thread = threading.Thread(
+        target=run, name="pipeline-thread-B", daemon=True
+    )
+    thread.start()
+    thread.join(timeout=5.0)
+    assert not thread.is_alive(), "run() hung when the final flush raised"
+    assert isinstance(error.get("exc"), RuntimeError), "flush error was not propagated"
+    assert source.stopped, "source.stop() was skipped when flush_all raised (leak)"
+
+
+# --- C: the age trigger under sustained traffic (kills the deleted-poll mutant)
+
+
+def test_age_flush_under_sustained_traffic() -> None:
+    """Under traffic the queue is never empty, so the None-timeout branch never
+    runs; the trailing maybe_flush_on_age() after each item is the ONLY live age
+    path. Deleting it drops this from >=2 emits to exactly 1 (final flush)."""
+    emitted: list = []
+    lock = threading.Lock()
+
+    def emit(unit: dict) -> None:
+        with lock:
+            emitted.append(unit)
+
+    stop = threading.Event()
+    raw_queue = BoundedRawQueue(maxsize=4096)
+    interpreter = Interpreter()
+    # size never triggers; age (0.05 s) is the only mid-stream flush
+    router = BufferRouter(emit=emit, max_samples=10_000_000, max_age_s=0.05)
+    # poll_interval huge so the None-timeout branch can never fire under traffic
+    pipeline = Pipeline(
+        _NoopSource(), raw_queue, interpreter, router, stop, poll_interval=5.0
+    )
+
+    ctx_pkt = build_context_packet(fields=standard_context_fields())
+
+    def producer() -> None:
+        raw_queue.put(ctx_pkt)
+        deadline = time.monotonic() + 0.3
+        counter = 1
+        while time.monotonic() < deadline:
+            raw_queue.put(
+                build_data_packet(payload=TWO_SAMPLES, counter=counter & 0xF)
+            )
+            counter += 1
+            time.sleep(0.005)  # ~5 ms: queue never times out (< 5 s poll)
+        raw_queue.put(SHUTDOWN)
+
+    prod = threading.Thread(target=producer, name="producer", daemon=True)
+    thread = _run_in_thread(pipeline)
+    prod.start()
+    thread.join(timeout=JOIN_TIMEOUT_S)
+    assert not thread.is_alive(), "pipeline did not finish under sustained traffic"
+    prod.join(timeout=5.0)
+
+    with lock:
+        count = len(emitted)
+        first_num_samples = emitted[0]["num_samples"] if emitted else None
+    assert count >= 2, (
+        f"expected >=2 emits (mid-stream age flushes + final), got {count}; "
+        "the trailing maybe_flush_on_age() is the only live age path"
+    )
+    # a mid-stream age flush emits a small window, far below max_samples
+    assert first_num_samples is not None and first_num_samples < 10_000_000
+
+
+# --- G (library): Pipeline rejects a non-positive poll interval -----------
+
+
+def test_pipeline_rejects_nonpositive_poll_interval() -> None:
+    kwargs = dict(
+        source=_NoopSource(),
+        raw_queue=BoundedRawQueue(maxsize=8),
+        interpreter=Interpreter(),
+        router=BufferRouter(emit=lambda _u: None, max_samples=10, max_age_s=1e9),
+        stop=threading.Event(),
+    )
+    with pytest.raises(ValueError):
+        Pipeline(**kwargs, poll_interval=0)
+    with pytest.raises(ValueError):
+        Pipeline(**kwargs, poll_interval=-1.0)
+
+
+# --- B/D/E/G(CLI): main() and the _build_runtime builder ------------------
+
+
+def test_main_live_bind_failure_exits_nonzero_without_hanging() -> None:
+    """B: a live bind onto an occupied UDP port must exit nonzero, not hang."""
+    from sceptre_pipeline.__main__ import main
+
+    blocker = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    blocker.bind(("127.0.0.1", 0))
+    port = blocker.getsockname()[1]
+
+    result: dict = {}
+
+    def run() -> None:
+        result["code"] = main(
+            ["--live", "--host", "127.0.0.1", "--port", str(port)]
+        )
+
+    thread = threading.Thread(target=run, name="cli-live-bindfail", daemon=True)
+    try:
+        thread.start()
+        thread.join(timeout=JOIN_TIMEOUT_S)
+        assert not thread.is_alive(), "main() hung on a live bind failure"
+        assert result["code"] != 0, "a live bind failure exited 0"
+    finally:
+        blocker.close()
+
+
+def test_main_replay_missing_file_exits_nonzero(tmp_path) -> None:
+    """E: a failed replay (missing file) exits nonzero and does not hang."""
+    from sceptre_pipeline.__main__ import main
+
+    missing = tmp_path / "nope.pkl"
+    result: dict = {}
+
+    def run() -> None:
+        result["code"] = main(["--replay", str(missing)])
+
+    thread = threading.Thread(target=run, name="cli-replay-missing", daemon=True)
+    thread.start()
+    thread.join(timeout=JOIN_TIMEOUT_S)
+    assert not thread.is_alive(), "main() hung on a missing replay file"
+    assert result["code"] != 0, "a failed replay exited 0"
+
+
+def test_cli_rejects_nonpositive_poll_interval() -> None:
+    """G (CLI): --poll-interval 0 is a usage error (exit 2), before construction."""
+    from sceptre_pipeline.__main__ import main
+
+    with pytest.raises(SystemExit) as exc:
+        main(["--replay", "foo.pkl", "--poll-interval", "0"])
+    assert exc.value.code == 2
+
+
+def test_build_runtime_live_record_default_is_bounded_recorder() -> None:
+    """D(1): --live --record (no path) => a bounded Recorder attached to the
+    LiveSource, capped at DEFAULT_LIVE_RECORD_MAX_BYTES."""
+    from sceptre_pipeline.__main__ import _build_runtime, build_parser
+    from sceptre_pipeline.recorder import DEFAULT_LIVE_RECORD_MAX_BYTES, Recorder
+
+    args = build_parser().parse_args(
+        ["--live", "--host", "127.0.0.1", "--port", "5000", "--record"]
+    )
+    rt = _build_runtime(args)
+    assert isinstance(rt.recorder, Recorder)
+    assert rt.recorder._max_bytes == DEFAULT_LIVE_RECORD_MAX_BYTES
+    assert rt.source._recorder is rt.recorder, "recorder not attached to LiveSource"
+
+
+def test_build_runtime_record_tristate_paths(tmp_path) -> None:
+    """D(2,3): tri-state --record — explicit PATH, bare (default path), absent."""
+    from sceptre_pipeline.__main__ import _build_runtime, build_parser
+    from sceptre_pipeline.recorder import Recorder
+
+    # explicit path honored verbatim
+    explicit = tmp_path / "cap.pkl"
+    args = build_parser().parse_args(
+        ["--live", "--host", "127.0.0.1", "--port", "5000", "--record", str(explicit)]
+    )
+    rt = _build_runtime(args)
+    assert isinstance(rt.recorder, Recorder)
+    assert rt.record_path == explicit
+
+    # bare --record => auto default path under cwd/recordings
+    import os
+
+    cwd = os.getcwd()
+    os.chdir(tmp_path)
+    try:
+        args = build_parser().parse_args(
+            ["--live", "--host", "127.0.0.1", "--port", "5000", "--record"]
+        )
+        rt = _build_runtime(args)
+    finally:
+        os.chdir(cwd)
+    assert rt.record_path is not None
+    assert rt.record_path.parent == tmp_path / "recordings"
+
+    # no --record => no recorder, no path
+    args = build_parser().parse_args(
+        ["--live", "--host", "127.0.0.1", "--port", "5000"]
+    )
+    rt = _build_runtime(args)
+    assert rt.recorder is None
+    assert rt.record_path is None
+    assert rt.source._recorder is None
+
+
+def test_build_runtime_replay_has_no_recorder() -> None:
+    """D(4): the replay path wires a ReplaySource and no recorder."""
+    from sceptre_pipeline.__main__ import _build_runtime, build_parser
+
+    args = build_parser().parse_args(["--replay", "foo.pkl"])
+    rt = _build_runtime(args)
+    assert isinstance(rt.source, ReplaySource)
+    assert rt.recorder is None
+    assert rt.record_path is None

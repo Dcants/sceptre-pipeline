@@ -68,6 +68,8 @@ class LiveSource(PacketSource):
         self._buffer_size = buffer_size
         self._rcvbuf_bytes = rcvbuf_bytes
         self._thread: threading.Thread | None = None
+        self.failed = False
+        """Set True if the recv loop aborted on a socket error (e.g. bind failure)."""
         self.ready = threading.Event()
         """Set once the socket is bound (or binding failed); see bound_address."""
         self.bound_address: tuple[str, int] | None = None
@@ -148,6 +150,7 @@ class LiveSource(PacketSource):
                     if self._recorder is not None:
                         self._recorder.append(time.time_ns(), addr, data)
         except OSError:
+            self.failed = True
             logger.exception("LiveSource socket error; source stopped")
         finally:
             if self._recorder is not None:
@@ -185,6 +188,9 @@ class ReplaySource(PacketSource):
         self._stop = stop
         self._pace = pace
         self._thread: threading.Thread | None = None
+        self.failed = False
+        """Set True if replay aborted (missing/corrupt capture). SHUTDOWN is
+        still always enqueued; this only lets the CLI exit nonzero."""
 
     def start(self) -> None:
         self._thread = threading.Thread(
@@ -218,6 +224,7 @@ class ReplaySource(PacketSource):
                 prev_ts_ns = ts_ns
                 self._raw_queue.put(packet[3])
         except Exception:
+            self.failed = True
             logger.exception("ReplaySource failed replaying %s", self._path)
         finally:
             # ALWAYS signal end-of-stream — even on a bad/corrupt capture —

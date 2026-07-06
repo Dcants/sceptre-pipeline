@@ -28,6 +28,7 @@ import logging
 import threading
 from typing import TYPE_CHECKING
 
+from .interpreter import _RateLimitedLog
 from .queues import SHUTDOWN
 
 if TYPE_CHECKING:
@@ -58,12 +59,17 @@ class Pipeline:
         stop: threading.Event,
         poll_interval: float = DEFAULT_POLL_INTERVAL_S,
     ) -> None:
+        if poll_interval <= 0:
+            # a non-positive timeout makes Condition.wait_for degenerate to a
+            # non-blocking check, busy-spinning Thread B at 100% CPU
+            raise ValueError("poll_interval must be > 0")
         self._source = source
         self._raw_queue = raw_queue
         self._interpreter = interpreter
         self._router = router
         self._stop = stop
         self._poll_interval = poll_interval
+        self._log = _RateLimitedLog()
 
     def run(self) -> None:
         """Run Thread B on the calling thread until SHUTDOWN or ``stop()``.
@@ -92,23 +98,37 @@ class Pipeline:
                     # design, but a bug in the guard itself must not kill Thread
                     # B (Stage 2.75 defense-in-depth)
                     record = interpreter.process(item)
-                except Exception:
+                except Exception as exc:
                     interpreter.errors += 1
+                    if self._log.should_log("process-guard"):
+                        # rate-limited, matching every other drop path's
+                        # convention: a fully silent drop hides guard bugs
+                        logger.warning(
+                            "interpreter.process raised past its own guard; "
+                            "datagram dropped: %s",
+                            exc,
+                        )
                     continue
                 if record:
                     router.push(record)
                 router.maybe_flush_on_age()
         finally:
-            router.flush_all()  # final partial window of EVERY stream
-            source.stop()  # joins Thread A (the source's own join timeout)
-            logger.info(
-                "pipeline stopped: queue_dropped=%d interpreter_errors=%d "
-                "interpreter_dropped=%d router_dropped=%d",
-                raw_queue.dropped,
-                interpreter.errors,
-                interpreter.dropped,
-                router.dropped,
-            )
+            # flush_all() calls the emit callback bare, so an emit that raises
+            # here must NOT skip the Thread-A join and counter log (a leaked
+            # recv loop / growing recorder in library embeddings). The original
+            # exception still propagates out of the inner finally.
+            try:
+                router.flush_all()  # final partial window of EVERY stream
+            finally:
+                source.stop()  # joins Thread A (the source's own join timeout)
+                logger.info(
+                    "pipeline stopped: queue_dropped=%d interpreter_errors=%d "
+                    "interpreter_dropped=%d router_dropped=%d",
+                    raw_queue.dropped,
+                    interpreter.errors,
+                    interpreter.dropped,
+                    router.dropped,
+                )
 
     def stop(self) -> None:
         """Signal Thread B (and the source) to stop; idempotent, any-thread safe.
