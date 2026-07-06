@@ -391,3 +391,120 @@ timestamp  = (int_ts or 0) + (frac_ps or 0) / 1e12
 2. `python -m sceptre_pipeline --replay recordings/single_frequency.pkl` — observe steady-state emits at RF 97.3 MHz / SR 625 kHz; total ≈ 3,127,320 samples; clean exit.
 3. `python -m sceptre_pipeline --replay recordings/change_frequency.pkl` — observe the 97.3 → 103.7 MHz transition with the old-context-labeled boundary window.
 4. `python receiver/recieve_udp.py --duration 2` (or loopback sender) — confirm captures land in `recordings/` and reload; confirm `LiveSource` fan-out records while the live path stays lossy/bounded.
+
+---
+---
+
+# Part II — Downstream consumer: spectrogram images + YOLO detection (Stages 5–8)
+
+## Context (Part II)
+
+Stages 0–4 are complete, merged, and **live-verified against the real Sceptre** (2026-07-06: 2 MS/s stream, gap-free full windows, `rf_hz`/`sample_rate_hz` tracking retunes). Part II adds the first real consumer: convert each emitted unit into a spectrogram image and run a YOLO-style detector on it — initially trained for drone signals at 2.4 GHz, but designed so that retargeting (e.g. 915 MHz next year) is *retraining only*: same architecture, same code, different training data, **zero pipeline changes**. The portability comes from rendering in SNR space (Appendix B).
+
+**Boundary rules (binding for all Part II stages):**
+- `sceptre_pipeline` stays stdlib+numpy (test_smoke enforces it). The consumer is a NEW sibling package **`src/sceptre_detect/`** in this repo (src-layout auto-discovery picks it up; verify test_smoke's import-purity check stays scoped to `sceptre_pipeline`). Heavy deps (torch/ultralytics/opencv) are optional extras (`pip install -e .[detect]`) and lazily imported. Dependency direction is one-way: `sceptre_detect` imports `sceptre_pipeline`, never the reverse.
+- **Thread B is sacred.** The emit callback does nothing but enqueue (non-blocking, drop-oldest, counted). All FFT/normalization/inference runs on the consumer thread (Thread C). numpy FFT and torch inference release the GIL, so plain threads genuinely overlap.
+- Every stage is independently testable offline against the two recordings plus synthetic units; no model weights are needed anywhere (Stage 7's gate provides a `FakeDetector` so CI stays hermetic).
+- Emitted-unit contract (from `IngestBuffer.flush()`, pinned by Part I tests): `samples` (1-D `complex64`, shape `(num_samples,)`), `context` (`rf_hz`, `sample_rate_hz`, `bandwidth_hz`, …), `start_timestamp` (unix float), `num_samples`, `stream_id`.
+
+---
+
+## ⚠️ Appendix B — Spectrogram & normalization ground rules (binding; OVERRIDE any stage prose that conflicts)
+
+**B1 — Transform chain, fixed order.** Frame the 1-D complex window into frames of `nfft` samples advancing by `hop` → apply the window function → **full FFT** (never `rfft`: complex baseband's negative frequencies carry real content) → `fftshift` each row (center frequency at the center column, below-center to the LEFT) → power dB: `10*log10(|X|**2 + 1e-12)`. Orientation: rows = time (oldest first), cols = frequency. This orientation must be pinned by a **sign test** (a tone at −fs/4 lights the left half), not assumed.
+
+**B2 — Normalization = floating floor + fixed span. Both alternatives are forbidden, for tested reasons:**
+- *Per-image min-max is forbidden:* a strong signal compresses weak neighbors toward the noise color; an empty frame stretches noise to full contrast; the same signal at the same SNR renders differently frame to frame.
+- *Absolute dB limits are forbidden:* the floor moves with gain (this Sceptre spans 0–116 dB), attenuation, AGC, antenna, bandwidth, and band.
+- The rule: `floor = percentile(S_db, p)` (default `p=20`), `img = clip((S_db - floor) / span_db, 0, 1)` (default `span_db=60`). This fixes the SNR→pixel mapping: a 20 dB-SNR burst renders identically at any gain/antenna/band — that is the invariance that makes one model portable. Strong signals clip at 1.0 (harmless: box geometry survives); each signal's brightness reflects *its own* SNR, independent of neighbors.
+- *Crowded-band caveat (2.4 GHz ISM — exactly where drones live):* if occupancy is high the percentile biases upward. Mitigations, in order: lower `p` (~10), and/or track the floor with **min-hold / EMA over trailing frames** (`floor_t = α*est + (1-α)*floor_{t-1}`; the floor moves slowly, signals come and go). EMA state persists across units → it lives in a `FloorTracker` object, `α=1.0` disables.
+
+**B3 — TRAIN/DEPLOY IDENTITY (iron rule, gates Stage 7).** Every rendering parameter — `nfft`, `hop`, window fn, `p`, `span_db`, EMA constants, colormap/channels, resize, axis orientation — must match the model's training preprocessing exactly. All defaults in this plan are **provisional** until the training spec is obtained and recorded here (see the Stage 7 gate). Training data must be generated with the identical normalization and augmented across SNR within the span.
+
+**B4 — One-unit-one-image sizing.** An image of `F` time-frames needs `N = F*hop + (nfft - hop)` samples; set the pipeline's `--max-samples` to `N` so one emitted unit = one image (e.g. `F=640, nfft=1024, hop=512` → `N=328,192` ≈ 0.164 s @ 2 MS/s ≈ 6 images/s). Bursts straddling window boundaries get truncated — acceptable initially; consumer-side overlap margin is a named later refinement (never a pipeline change).
+
+**B5 — Box→physics mapping (why context rides on every unit).** With `meta = {nfft, hop, fs=sample_rate_hz, rf=rf_hz, t0=start_timestamp, resize scale factors}`:
+```
+t_start   = t0 + row0*hop/fs          duration  = (row1-row0)*hop/fs
+f_center  = rf + (col_c - ncols/2)*fs/nfft      bandwidth = (col1-col0)*fs/nfft
+```
+Detections are reported in absolute seconds/Hz — "burst at 2.4471 GHz, 180 kHz wide, 14:32:07.216, 40 ms".
+
+---
+
+## ⚠️ Appendix C — Live deployment ground truth (verified 2026-07-06 on the real Sceptre)
+
+- **Wire-rate budget** (complex float32 = 8 B/sample + ~0.4% VITA overhead): 625 kHz → ~40 Mbit/s (Wi-Fi OK); 2 MS/s → ~130 Mbit/s (wired; worked clean in practice); 10 MS/s → ~650 Mbit/s (clean GigE); 20 MS/s → **~1.3 Gbit/s — exceeds 1 GbE line rate**; only loopback (run the pipeline on the Sceptre host) or ≥2.5 GbE carries it. Symptom of an over-budget link: `packet counter gap` warnings + tiny gap-flushed windows (e.g. 2,040 = 2×1020), with `queue_dropped=0` proving the loss is upstream of the program.
+- **8192-byte data packets fragment** (6 IP fragments @ MTU 1500); routers/firewalls between subnets commonly drop fragments → total silence even though small UDP traverses. Fixes: same-L2 placement, allow fragments, packet size ≤ ~1400 B (≤171 samples/pkt — the interpreter derives sizes per-packet, nothing assumes 1020), or co-locate on loopback (64 KB MTU).
+- **Sample rate is NOT on the tuner object.** The tuner API (`/api/v1/streams/input_1/tuner`) owns frequency/gain; it reports `min_bandwidth=max_bandwidth=0.0` (empty settable range) and silently ignores writes to unsupported fields. The rate knob is per-stream **DDC decimation** on the stream/output object (verified: recordings are 20 MHz/32 = 625 kHz, BW 500 kHz = 0.8×rate, custom stream_id 123).
+- **Field architecture:** co-locate ingest with the radio; ship *windows or detections* across the network, not raw IQ. Packet size and link constraints never touch the model: it consumes windows.
+
+---
+
+## Stage 5 — Unit handoff queue + consumer skeleton
+
+**Objective.** Move units from Thread B to a consumer thread with bounded, lossy, counted handoff, plus the `sceptre_detect` package skeleton and CLI entry point. After this stage, the demo printer runs on Thread C instead of inside emit.
+
+**Files:** create `src/sceptre_detect/__init__.py`, `src/sceptre_detect/handoff.py`, `src/sceptre_detect/__main__.py` (skeleton), `tests/test_detect_handoff.py`; modify `pyproject.toml` (package discovery + `[detect]` extra).
+
+**Implementation prompt.** *(Include Appendix B/C.)* **Reuse `sceptre_pipeline.queues.BoundedRawQueue` verbatim as the unit queue** — it is payload-agnostic (`put`/`get(timeout)`/`dropped`/`__len__`, drop-oldest-and-count); do NOT write a second lossy queue. Wiring: `BufferRouter(emit=unit_queue.put, ...)` — emit does nothing else. `ConsumerRunner(queue, process, stop, poll_interval=0.1)`: Thread C loop mirroring `Pipeline.run`'s conventions — `get(timeout)`; `None` → continue; unit → `process(unit)` in a per-unit try/except (errors counted + rate-limited log via the `_RateLimitedLog` pattern; one bad unit must not kill Thread C); Event-based `stop()`; on exit log units-processed / queue-dropped / errors and current queue depth. `python -m sceptre_detect --replay PATH | --live --port N` wires pipeline + queue + a summary-printer `process` (Stage 5's stand-in for the detector).
+
+**Acceptance criteria.**
+- Replay `single_frequency.pkl` end-to-end through pipeline→queue→consumer: consumer processes every emitted unit (counts match, unit-queue `dropped == 0`), total samples 3,127,320, both threads join cleanly, no hang.
+- Slow-consumer test: `process` sleeps → the unit queue fills, **oldest units drop and are counted**, and Part I's counters stay clean (Thread B never blocks; replay total emitted unchanged). This pins the backpressure invariant.
+- `pip install -e .` still yields an import-pure `sceptre_pipeline` (test_smoke green); full Part I suite stays green.
+
+## Stage 6 — Spectrogram engine (numpy-only)
+
+**Objective.** `spectrogram(unit, cfg, tracker) -> (img, meta)` implementing Appendix B exactly: framing, full FFT, fftshift, dB, floor+span normalization with percentile/EMA floor tracking.
+
+**Files:** create `src/sceptre_detect/spectrogram.py`, `tests/test_spectrogram.py`.
+
+**Implementation prompt.** *(Include Appendix B.)* Pure numpy (keep this module dependency-light even though `sceptre_detect` may use heavier deps elsewhere). `SpectrogramConfig` dataclass: `nfft`, `hop`, `window` (default hann — provisional per B3), `floor_percentile`, `span_db`, `ema_alpha`. Frame via `numpy.lib.stride_tricks.sliding_window_view` (no copy). `FloorTracker` holds EMA state across units. Output: `float32` image, shape `(F, nfft)`, values in `[0,1]`, plus the B5 `meta` dict (include the floor_db actually used — it is the per-image calibration record).
+
+**Acceptance criteria (synthetic, deterministic).**
+- **Orientation sign test:** a tone at +fs/4 lights the expected column right of center; at −fs/4, left of center (pins full-FFT + fftshift; would fail under rfft or a missing shift).
+- **SNR invariance:** the same burst rendered with the absolute floor shifted +30 dB produces pixel-identical output within tolerance (pins B2's whole point).
+- **Multi-signal independence:** a weak burst's pixels change < tolerance when a strong signal is added in another sub-band (pins percentile-floor robustness).
+- **Crowded-band bound:** at ≥50% occupancy, the `p=10` floor estimate stays within a stated tolerance of the true injected floor while `p=50` demonstrably biases (documents WHY the default is low).
+- **Sizing identity:** `N = F*hop + (nfft-hop)` exact round-trip (B4).
+- Real-recording smoke: a `single_frequency` unit renders finite, in-range, correctly-shaped output.
+
+## Stage 7 — Detector adapter + box→physics mapping ⛔ GATED
+
+**GATE: before implementing the real YOLO adapter, obtain the model's training preprocessing spec** (image size, channels/colormap, nfft/hop/window, normalization rule, axis orientation) **and record it in Appendix B**, replacing the provisional defaults. Everything except the ultralytics binding is implementable and testable now via the protocol + fake.
+
+**Objective.** A `Detector` protocol, a `FakeDetector` for hermetic tests, the (gated) ultralytics adapter, and `map_box` from pixel boxes to physical `Detection`s.
+
+**Files:** create `src/sceptre_detect/detect.py`, `tests/test_detect.py`.
+
+**Implementation prompt.** *(Include Appendix B.)* `Detector` protocol: `detect(img) -> list[Box]` with `Box = (x0, y0, x1, y1, conf, cls)` in pixel coords of the model's input. Resize/letterbox from `(F, nfft)` to the model input is the adapter's job and its scale factors go into `meta` so `map_box` inverts them (B5). Channel handling (grayscale→3ch replicate vs colormap) is config, per the training spec. `Detection` dataclass: `t_start`, `duration_s`, `f_center_hz`, `bandwidth_hz`, `conf`, `cls`, `stream_id`. Ultralytics import is lazy and behind the `[yolo]` extra; `FakeDetector` returns scripted boxes.
+
+**Acceptance criteria.**
+- Ground-truth round-trip: place a synthetic burst at known (t, f, duration, bandwidth) → spectrogram → feed `FakeDetector` its true pixel box → mapped `Detection` matches ground truth within one hop / one bin.
+- **Sign test on mapping:** a burst below center frequency maps to `f_center_hz < rf_hz` (mirror bugs are silent otherwise).
+- Resize round-trip: mapping stays exact through a non-trivial resize (e.g. (640, 1024) → (640, 640)).
+
+## Stage 8 — End-to-end detect runtime + mission profiles
+
+**Objective.** `python -m sceptre_detect` running the full loop — pipeline → unit queue → spectrogram → detector → reported detections — with named mission profiles, ops counters, and an offline E2E test.
+
+**Files:** modify `src/sceptre_detect/__main__.py`, create `src/sceptre_detect/profiles.py`, `tests/test_detect_runtime.py`; README section.
+
+**Implementation prompt.** *(Include Appendices B/C.)* A mission profile is a named bundle: `SpectrogramConfig` values + `--max-samples` derived via B4 + model path + confidence threshold (e.g. `--profile drone-2g4`, defaults provisional per B3); CLI flags override profile fields. Report = one printed line per `Detection` (absolute Hz/seconds) with optional `--out detections.jsonl`. Shutdown summary extends Part I's: units in/processed, unit-queue dropped, consumer errors, and mean unit→detection latency (`time.monotonic`). The Appendix C co-location guidance goes in the README: this process is designed to run next to the radio; detections, not IQ, cross the network.
+
+**Acceptance criteria.**
+- Offline E2E with `FakeDetector`: `--replay change_frequency.pkl` produces detections whose `f_center_hz` values track 97.3 → 103.7 MHz through the mapping (proves context is plumbed into the physics end-to-end).
+- Backpressure E2E: a deliberately slow fake model → unit drops counted, Part I counters clean, prompt clean shutdown of all three threads (A, B, C), no hang.
+- Latency reported; README quickstart runs as written; entire suite (Part I + II) green.
+
+---
+
+## Cross-cutting correctness checklist (Part II — repeat in every stage prompt)
+
+- **Emit does nothing but enqueue**; every queue is bounded, drop-oldest, counted (reuse `BoundedRawQueue`).
+- **Full FFT + fftshift**, orientation pinned by sign tests (spectrogram AND box mapping).
+- **Floor + fixed span only** — per-image min-max and absolute limits are defects, not choices.
+- **Train/deploy identity**: provisional defaults must be replaced by the recorded training spec before the real adapter ships (Stage 7 gate).
+- **One-unit-one-image** sizing via B4; boundary truncation accepted, overlap is consumer-side future work.
+- One-way dependency `sceptre_detect` → `sceptre_pipeline`; heavy deps optional + lazy; test_smoke stays green.
