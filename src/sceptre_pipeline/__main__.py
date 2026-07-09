@@ -25,6 +25,7 @@ from typing import Any, NamedTuple
 
 from .buffer import DEFAULT_FLUSH_FIELDS, BufferRouter, Emit
 from .interpreter import DEFAULT_MAX_STREAMS, Interpreter
+from .metrics import ThroughputMeter
 from .queues import BoundedRawQueue
 from .recorder import (
     DEFAULT_LIVE_RECORD_MAX_BYTES,
@@ -218,7 +219,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    runtime = _build_runtime(args)
+    # Wrap the demo consumer so every emitted unit is tallied on its way out;
+    # the meter's summary logs at shutdown next to the "pipeline stopped" line.
+    meter = ThroughputMeter(demo_emit)
+    runtime = _build_runtime(args, emit=meter)
     pipeline = runtime.pipeline
     source = runtime.source
 
@@ -239,6 +243,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ).start()
 
     start_time_ns = time.time_ns()
+    meter.start()
     try:
         pipeline.run()
     except KeyboardInterrupt:
@@ -246,6 +251,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         # already unwound (flush + join + log); stop() just re-sets the Event.
         logger.info("interrupted; shutting down")
         pipeline.stop()
+
+    # Logs on every exit path (replay EOF and live Ctrl-C alike), right after
+    # the "pipeline stopped: ..." counter line from run()'s finally.
+    logger.info(meter.summary())
 
     exit_code = 0
     if bind_failed.is_set():
