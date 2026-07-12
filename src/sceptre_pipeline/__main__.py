@@ -61,6 +61,7 @@ def demo_emit(unit: dict[str, Any]) -> None:
         f"dtype={samples.dtype} "
         f"rf_hz={context.get('rf_hz')} "
         f"sample_rate_hz={context.get('sample_rate_hz')} "
+        f"bandwidth_hz={context.get('bandwidth_hz')} "
         f"start_timestamp={unit['start_timestamp']}"
     )
 
@@ -255,6 +256,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     # Logs on every exit path (replay EOF and live Ctrl-C alike), right after
     # the "pipeline stopped: ..." counter line from run()'s finally.
     logger.info(meter.summary())
+    # Capture efficiency: delivered vs the rate the stream declared. Surfaces
+    # silent upstream loss (kernel/link drops) the drop counters cannot see.
+    # LIVE ONLY: the ratio is only meaningful when wall-clock is real time. An
+    # unpaced replay measures CPU speed; even a PACED replay only matches when
+    # the recording's pacing matches its declared rate (not guaranteed — a gappy
+    # recording replays as false loss), so replay is excluded entirely.
+    capture = meter.capture_summary()
+    if capture is not None and args.live:
+        logger.info(capture)
 
     exit_code = 0
     if bind_failed.is_set():
