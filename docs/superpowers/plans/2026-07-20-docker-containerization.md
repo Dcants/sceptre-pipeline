@@ -332,6 +332,10 @@ Replay a different capture, paced at its recorded packet timing:
 docker compose run --rm replay --replay /data/recordings/change_frequency.pkl --pace
 ```
 
+> **Git Bash on Windows:** MSYS rewrites container paths like
+> `/data/recordings/…` into Windows paths before Docker sees them. Prefix such
+> commands with `MSYS_NO_PATHCONV=1`. PowerShell and cmd are unaffected.
+
 Ingest live while recording the raw packets (interactive; Ctrl-C stops it;
 `--service-ports` is required because `docker compose run` does not publish
 ports by default):
