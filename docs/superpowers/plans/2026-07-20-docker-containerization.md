@@ -334,8 +334,9 @@ docker compose stop live
   (`docker compose run --rm replay --help` shows them all).
 - **Linux hosts:** the container runs as uid 1000 (`appuser`); if your user
   has a different uid, give the live service write access to `./recordings`
-  before using `--record` — e.g. `chmod a+w recordings`, or add
-  `user: "$(id -u):$(id -g)"` to the `live` service.
+  before using `--record` — e.g. `chmod a+w recordings`, or run the service
+  as your own uid: `docker compose run --user "$(id -u):$(id -g)" --rm
+  --service-ports live --live --host 0.0.0.0 --port 5000 --record`.
 
 Replay a different capture, paced at its recorded packet timing:
 
