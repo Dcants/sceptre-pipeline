@@ -6,70 +6,6 @@ VITA-49.2 subset (VRL disabled, no VRT trailer on context packets). The runtime 
 > **UDP packets → interpret → accumulate → emit `{numpy array + typed context dict}`**
 > to downstream consumers (FFT / recording / audio).
 
-## Run it
-
-1. Install [Docker](https://docs.docker.com/get-docker/) if you don't have it.
-2. Clone this repo, and from its folder start listening on the IP and port you
-   want (this is where the Sceptre should be streaming):
-
-```sh
-SCEPTRE_HOST=192.168.1.50 SCEPTRE_PORT=5000 docker compose up live
-```
-
-PowerShell:
-
-```powershell
-$env:SCEPTRE_HOST="192.168.1.50"; $env:SCEPTRE_PORT="5000"; docker compose up live
-```
-
-Swap in your own IP and port. Both are optional — plain
-`docker compose up live` listens on every interface at port 5000.
-
-You'll see one line per emitted unit as data flows. **Ctrl-C stops it cleanly**
-(final flush + throughput summary), as does `docker compose stop live`.
-
-To record the raw packets while listening (the capture saves into
-`./recordings/` when you stop):
-
-```sh
-docker compose run --rm --service-ports live --live --host 0.0.0.0 --port 5000 --record
-```
-
-(`--service-ports` is required — `docker compose run` doesn't publish ports on
-its own. Match `--port` to `SCEPTRE_PORT` if you changed it.)
-
-## Replay a capture (no SDR needed)
-
-Run the pipeline against a recorded capture — useful for testing without
-hardware; two captures ship with the repo:
-
-```sh
-docker compose run --rm replay        # replays recordings/single_frequency.pkl
-docker compose run --rm replay --replay /data/recordings/change_frequency.pkl --pace
-```
-
-Your `./recordings/` folder is mounted at `/data/recordings` inside the
-container; `--pace` plays back at the recorded packet timing.
-
-## Check it works on a new machine
-
-```sh
-docker build --target test .
-```
-
-Builds the image and runs the full test suite inside it — the build fails if
-anything is broken.
-
-## Configuration
-
-| Variable | Default | What it does |
-|---|---|---|
-| `SCEPTRE_HOST` | all interfaces | Which of your machine's IPs to listen on |
-| `SCEPTRE_PORT` | `5000` | UDP port to listen on |
-
-The container takes the exact same flags as the local CLI —
-`docker compose run --rm replay --help` lists them all.
-
 ## Architecture
 
 Two threads, one bounded queue between them:
@@ -103,6 +39,77 @@ Two threads, one bounded queue between them:
 
 Emitted units go to a pluggable `on_emit(unit)` callback, so a queue-backed sink
 can drop in later.
+
+## Run it
+
+1. Install [Docker](https://docs.docker.com/get-docker/) if you don't have it.
+2. Clone this repo, and from its folder run:
+
+```sh
+SCEPTRE_PORT=XXXX docker compose up live
+#Listens on every interface at a defined port#
+
+SCEPTRE_HOST=X.X.X.X SCEPTRE_PORT=XXXX docker compose up live
+#Listens on a defined interface at a defined port#
+```
+
+
+```powershell
+$env:SCEPTRE_PORT="XXXX"; docker compose up live
+#Listens on every interface at a defined port#
+
+$env:SCEPTRE_HOST="X.X.X.X"; $env:SCEPTRE_PORT="XXXX"; docker compose up live
+#Listens on a defined interface at a defined port#
+```
+
+Swap in your own IP and port. Both are optional — plain
+`docker compose up live` listens on every interface at port 5000.
+
+You'll see one line per emitted unit as data flows. **Ctrl-C stops it cleanly**
+(final flush + throughput summary), as does `docker compose stop live`.
+
+To record the raw packets while listening (the capture saves into
+`./recordings/` when you stop):
+
+```sh & pwsh
+docker compose run --rm --service-ports live --live --host 0.0.0.0 --port 5000 --record
+```
+
+(`--service-ports` is required — `docker compose run` doesn't publish ports on
+its own. Match `--port` to `SCEPTRE_PORT` if you changed it.)
+
+## Replay a capture (no SDR needed)
+
+Run the pipeline against a recorded capture — useful for testing without
+hardware; two captures ship with the repo:
+
+```sh & pwsh
+docker compose run --rm replay        # replays recordings/single_frequency.pkl
+docker compose run --rm replay --replay /data/recordings/change_frequency.pkl --pace
+```
+
+Your `./recordings/` folder is mounted at `/data/recordings` inside the
+container; `--pace` plays back at the recorded packet timing.
+
+## Check it works on a new machine
+
+```sh
+docker build --target test .
+```
+
+Builds the image and runs the full test suite inside it — the build fails if
+anything is broken.
+
+## Configuration
+
+| Variable | Default | What it does |
+|---|---|---|
+| `SCEPTRE_HOST` | all interfaces | Which of your machine's IPs to listen on |
+| `SCEPTRE_PORT` | `5000` | UDP port to listen on |
+
+The container takes the exact same flags as the local CLI —
+`docker compose run --rm replay --help` lists them all.
+
 
 ## Local development (without Docker)
 
