@@ -72,18 +72,28 @@ No changes to pipeline source code — it is container-ready as-is.
     output at `/data/recordings/…`, which is the host's `./recordings/`.
   - Command: `--live --host 0.0.0.0 --port ${SCEPTRE_PORT:-5000}` — `--record`
     stays opt-in, appended by the user, matching CLI behavior.
-  - `stop_signal: SIGINT` + `stop_grace_period: 10s`.
+  - `stop_signal: SIGINT` on both services. `stop_grace_period: 10s` on
+    `replay`; `stop_grace_period: 60s` on `live` (see Shutdown semantics).
 
 ## Shutdown semantics (load-bearing)
 
 `docker stop` sends SIGTERM by default; Python does not turn SIGTERM into
 `KeyboardInterrupt`, so the pipeline's clean-shutdown path (final flush,
 throughput summary, capture-efficiency line, recording save) would be skipped
-and the process killed. Setting `stop_signal: SIGINT` on the `live` service
-makes `docker stop` / `docker compose down` equivalent to Ctrl-C, which the CLI
+and the process killed. Setting `stop_signal: SIGINT` on both services makes
+`docker stop` / `docker compose down` equivalent to Ctrl-C, which the CLI
 already handles cleanly. Interactive `docker compose run` forwards Ctrl-C as
 SIGINT natively. Replay runs end on their own (SHUTDOWN sentinel), so the
-setting matters only for `live`, but is set on both services for consistency.
+signal choice matters only for `live`, but is set on both services for
+consistency.
+
+`stop_grace_period` differs by service: `replay` keeps the default `10s` —
+replay has no `--record` path in its committed command, so there is nothing
+large to flush. `live` uses `60s` because a `--record` shutdown pickles the
+in-memory capture (bounded up to 512 MB) to a bind-mounted host file; a
+SIGKILL that lands mid-write (once the grace period expires) truncates that
+file instead of leaving a valid `.pkl`. 60s is sized for that worst-case write
+on the bind mount, not for normal shutdown, which is typically much faster.
 
 ## Error handling
 

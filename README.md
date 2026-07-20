@@ -52,7 +52,7 @@ docker compose run --rm replay
 # Ingest live from a Sceptre SDR streaming to this machine on UDP port 5000:
 docker compose up live
 
-# Stop live ingest (clean shutdown: final flush + throughput summary):
+# Stop live ingest — from a second terminal, or just Ctrl-C (both shut down cleanly):
 docker compose stop live
 ```
 
@@ -62,6 +62,10 @@ docker compose stop live
   replay reads captures from it, and live `--record` output is saved to it.
 - The container takes the exact same flags as the local CLI
   (`docker compose run --rm replay --help` shows them all).
+- **Linux hosts:** the container runs as uid 1000 (`appuser`); if your user
+  has a different uid, give the live service write access to `./recordings`
+  before using `--record` — e.g. `chmod a+w recordings`, or add
+  `user: "$(id -u):$(id -g)"` to the `live` service.
 
 Replay a different capture, paced at its recorded packet timing:
 
@@ -71,11 +75,14 @@ docker compose run --rm replay --replay /data/recordings/change_frequency.pkl --
 
 > **Git Bash on Windows:** MSYS rewrites container paths like
 > `/data/recordings/…` into Windows paths before Docker sees them. Prefix such
-> commands with `MSYS_NO_PATHCONV=1`. PowerShell and cmd are unaffected.
+> commands with `MSYS_NO_PATHCONV=1`. PowerShell and cmd are unaffected. In
+> PowerShell, set the port with `$env:SCEPTRE_PORT="6000"` before running
+> compose.
 
 Ingest live while recording the raw packets (interactive; Ctrl-C stops it;
 `--service-ports` is required because `docker compose run` does not publish
-ports by default):
+ports by default; keep the two port numbers matched to `SCEPTRE_PORT` if you
+changed it):
 
 ```sh
 docker compose run --rm --service-ports live --live --host 0.0.0.0 --port 5000 --record
