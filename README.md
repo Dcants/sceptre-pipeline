@@ -40,39 +40,74 @@ Two threads, one bounded queue between them:
 Emitted units go to a pluggable `on_emit(unit)` callback, so a queue-backed sink
 can drop in later.
 
-## Quickstart
+## Quickstart (Docker — recommended)
+
+Runs on any machine with [Docker](https://docs.docker.com/get-docker/)
+installed — no Python setup needed.
+
+```sh
+# Replay the bundled capture (no SDR needed) — see the pipeline work end-to-end:
+docker compose run --rm replay
+
+# Ingest live from a Sceptre SDR streaming to this machine on UDP port 5000:
+docker compose up live
+
+# Stop live ingest (clean shutdown: final flush + throughput summary):
+docker compose stop live
+```
+
+- Point the SDR at the Docker host's IP, UDP port **5000**. Use a different
+  port with `SCEPTRE_PORT=6000 docker compose up live`.
+- Host `./recordings/` is mounted into both services at `/data/recordings`:
+  replay reads captures from it, and live `--record` output is saved to it.
+- The container takes the exact same flags as the local CLI
+  (`docker compose run --rm replay --help` shows them all).
+
+Replay a different capture, paced at its recorded packet timing:
+
+```sh
+docker compose run --rm replay --replay /data/recordings/change_frequency.pkl --pace
+```
+
+> **Git Bash on Windows:** MSYS rewrites container paths like
+> `/data/recordings/…` into Windows paths before Docker sees them. Prefix such
+> commands with `MSYS_NO_PATHCONV=1`. PowerShell and cmd are unaffected.
+
+Ingest live while recording the raw packets (interactive; Ctrl-C stops it;
+`--service-ports` is required because `docker compose run` does not publish
+ports by default):
+
+```sh
+docker compose run --rm --service-ports live --live --host 0.0.0.0 --port 5000 --record
+```
+
+Verify the full test suite passes on this machine (build fails if any test
+fails):
+
+```sh
+docker build --target test .
+```
+
+## Local development (without Docker)
+
+Python ≥ 3.10 (developed on 3.13 / numpy 2.3):
 
 ```sh
 pip install -e '.[dev]'
-```
 
-> **Note:** the `python -m sceptre_pipeline` CLI below lands in Stage 4 of the
-> build plan; until then only the test suite and the raw capture script run.
-
-Replay a recorded capture offline (no SDR needed):
-
-```sh
+# Replay a recorded capture offline (no SDR needed):
 python -m sceptre_pipeline --replay recordings/single_frequency.pkl
-```
 
-Ingest live from the SDR, optionally recording the raw packets:
-
-```sh
+# Ingest live from the SDR, optionally recording the raw packets:
 python -m sceptre_pipeline --live --host 0.0.0.0 --port 5000 --record
-```
 
-Capture raw UDP to a pickle without running the pipeline:
-
-```sh
+# Capture raw UDP to a pickle without running the pipeline:
 python receiver/recieve_udp.py --port 5000 --duration 5
 ```
-
-## Development
 
 - **Runtime dependencies are stdlib + numpy only.** `pytest` is dev-only; the
   shipped library imports nothing but the standard library and numpy (enforced
   by a test).
-- Target Python ≥ 3.10 (developed on 3.13 / numpy 2.3).
 - Run the test suite with `pytest`. The two captures in `recordings/`
   (`single_frequency.pkl`, `change_frequency.pkl`) are the empirical ground
   truth for the wire format — the interpreter and buffer are developed and
