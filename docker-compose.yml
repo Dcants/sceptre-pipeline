@@ -18,7 +18,8 @@ services:
       target: runtime
     image: sceptre-pipeline
     ports:
-      - "${SCEPTRE_PORT:-5000}:${SCEPTRE_PORT:-5000}/udp"
+      # SCEPTRE_HOST pins listening to one host interface (default: all).
+      - "${SCEPTRE_HOST:-0.0.0.0}:${SCEPTRE_PORT:-5000}:${SCEPTRE_PORT:-5000}/udp"
     volumes:
       - ./recordings:/data/recordings
     # default_recording_path(cwd) appends its own recordings/ subdir, so cwd

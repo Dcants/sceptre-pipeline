@@ -6,6 +6,70 @@ VITA-49.2 subset (VRL disabled, no VRT trailer on context packets). The runtime 
 > **UDP packets → interpret → accumulate → emit `{numpy array + typed context dict}`**
 > to downstream consumers (FFT / recording / audio).
 
+## Run it
+
+1. Install [Docker](https://docs.docker.com/get-docker/) if you don't have it.
+2. Clone this repo, and from its folder start listening on the IP and port you
+   want (this is where the Sceptre should be streaming):
+
+```sh
+SCEPTRE_HOST=192.168.1.50 SCEPTRE_PORT=5000 docker compose up live
+```
+
+PowerShell:
+
+```powershell
+$env:SCEPTRE_HOST="192.168.1.50"; $env:SCEPTRE_PORT="5000"; docker compose up live
+```
+
+Swap in your own IP and port. Both are optional — plain
+`docker compose up live` listens on every interface at port 5000.
+
+You'll see one line per emitted unit as data flows. **Ctrl-C stops it cleanly**
+(final flush + throughput summary), as does `docker compose stop live`.
+
+To record the raw packets while listening (the capture saves into
+`./recordings/` when you stop):
+
+```sh
+docker compose run --rm --service-ports live --live --host 0.0.0.0 --port 5000 --record
+```
+
+(`--service-ports` is required — `docker compose run` doesn't publish ports on
+its own. Match `--port` to `SCEPTRE_PORT` if you changed it.)
+
+## Replay a capture (no SDR needed)
+
+Run the pipeline against a recorded capture — useful for testing without
+hardware; two captures ship with the repo:
+
+```sh
+docker compose run --rm replay        # replays recordings/single_frequency.pkl
+docker compose run --rm replay --replay /data/recordings/change_frequency.pkl --pace
+```
+
+Your `./recordings/` folder is mounted at `/data/recordings` inside the
+container; `--pace` plays back at the recorded packet timing.
+
+## Check it works on a new machine
+
+```sh
+docker build --target test .
+```
+
+Builds the image and runs the full test suite inside it — the build fails if
+anything is broken.
+
+## Configuration
+
+| Variable | Default | What it does |
+|---|---|---|
+| `SCEPTRE_HOST` | all interfaces | Which of your machine's IPs to listen on |
+| `SCEPTRE_PORT` | `5000` | UDP port to listen on |
+
+The container takes the exact same flags as the local CLI —
+`docker compose run --rm replay --help` lists them all.
+
 ## Architecture
 
 Two threads, one bounded queue between them:
@@ -40,62 +104,6 @@ Two threads, one bounded queue between them:
 Emitted units go to a pluggable `on_emit(unit)` callback, so a queue-backed sink
 can drop in later.
 
-## Quickstart (Docker — recommended)
-
-Runs on any machine with [Docker](https://docs.docker.com/get-docker/)
-installed — no Python setup needed.
-
-```sh
-# Replay the bundled capture (no SDR needed) — see the pipeline work end-to-end:
-docker compose run --rm replay
-
-# Ingest live from a Sceptre SDR streaming to this machine on UDP port 5000:
-docker compose up live
-
-# Stop live ingest — from a second terminal, or just Ctrl-C (both shut down cleanly):
-docker compose stop live
-```
-
-- Point the SDR at the Docker host's IP, UDP port **5000**. Use a different
-  port with `SCEPTRE_PORT=6000 docker compose up live`.
-- Host `./recordings/` is mounted into both services at `/data/recordings`:
-  replay reads captures from it, and live `--record` output is saved to it.
-- The container takes the exact same flags as the local CLI
-  (`docker compose run --rm replay --help` shows them all).
-- **Linux hosts:** the container runs as uid 1000 (`appuser`); if your user
-  has a different uid, give the live service write access to `./recordings`
-  before using `--record` — e.g. `chmod a+w recordings`, or run the service
-  as your own uid: `docker compose run --user "$(id -u):$(id -g)" --rm
-  --service-ports live --live --host 0.0.0.0 --port 5000 --record`.
-
-Replay a different capture, paced at its recorded packet timing:
-
-```sh
-docker compose run --rm replay --replay /data/recordings/change_frequency.pkl --pace
-```
-
-> **Git Bash on Windows:** MSYS rewrites container paths like
-> `/data/recordings/…` into Windows paths before Docker sees them. Prefix such
-> commands with `MSYS_NO_PATHCONV=1`. PowerShell and cmd are unaffected. In
-> PowerShell, set the port with `$env:SCEPTRE_PORT="6000"` before running
-> compose.
-
-Ingest live while recording the raw packets (interactive; Ctrl-C stops it;
-`--service-ports` is required because `docker compose run` does not publish
-ports by default; keep the two port numbers matched to `SCEPTRE_PORT` if you
-changed it):
-
-```sh
-docker compose run --rm --service-ports live --live --host 0.0.0.0 --port 5000 --record
-```
-
-Verify the full test suite passes on this machine (build fails if any test
-fails):
-
-```sh
-docker build --target test .
-```
-
 ## Local development (without Docker)
 
 Python ≥ 3.10 (developed on 3.13 / numpy 2.3):
@@ -123,3 +131,12 @@ python receiver/recieve_udp.py --port 5000 --duration 5
 - Wire-format details (header layout, CIF walk, payload trimming, endianness)
   live in `docs/implementation-plan.md`, Appendix A — it overrides the PDF
   where they conflict.
+
+## Platform notes
+
+- **Git Bash on Windows:** MSYS rewrites container paths like
+  `/data/recordings/…` into Windows paths before Docker sees them. Prefix such
+  commands with `MSYS_NO_PATHCONV=1`. PowerShell and cmd are unaffected.
+- **Linux:** the container writes recordings as uid 1000 (`appuser`); if your
+  user has a different uid, run `chmod a+w recordings` once, or add
+  `--user "$(id -u):$(id -g)"` to `docker compose run`.
