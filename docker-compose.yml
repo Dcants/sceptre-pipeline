@@ -1,0 +1,29 @@
+services:
+  replay:
+    build:
+      context: .
+      target: runtime
+    image: sceptre-pipeline
+    volumes:
+      - ./recordings:/data/recordings:ro
+    command: ["--replay", "/data/recordings/single_frequency.pkl"]
+    # SIGINT (not the SIGTERM default) so `docker stop` takes the CLI's
+    # Ctrl-C clean-shutdown path: final flush + summaries + recording save.
+    stop_signal: SIGINT
+    stop_grace_period: 10s
+
+  live:
+    build:
+      context: .
+      target: runtime
+    image: sceptre-pipeline
+    ports:
+      - "${SCEPTRE_PORT:-5000}:${SCEPTRE_PORT:-5000}/udp"
+    volumes:
+      - ./recordings:/data/recordings
+    # default_recording_path(cwd) appends its own recordings/ subdir, so cwd
+    # /data lands bare `--record` output in /data/recordings == host ./recordings.
+    working_dir: /data
+    command: ["--live", "--host", "0.0.0.0", "--port", "${SCEPTRE_PORT:-5000}"]
+    stop_signal: SIGINT
+    stop_grace_period: 10s
