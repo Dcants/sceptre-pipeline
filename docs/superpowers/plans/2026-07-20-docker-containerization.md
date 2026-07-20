@@ -17,7 +17,7 @@
 - No changes to pipeline source code (`src/`), tests, or recordings.
 - Recordings are mounted at run time, never baked into the `runtime` target (only the `test` target copies them, as test fixtures).
 - CLI exit codes pass through unchanged: 0 success, 1 source/bind failure, 2 bad args.
-- `stop_signal: SIGINT` + `stop_grace_period: 10s` on both compose services (Python doesn't convert SIGTERM to `KeyboardInterrupt`; the CLI's clean-shutdown path needs SIGINT).
+- `stop_signal: SIGINT` on both compose services (Python doesn't convert SIGTERM to `KeyboardInterrupt`; the CLI's clean-shutdown path needs SIGINT). `stop_grace_period: 10s` on `replay`, `60s` on `live` (headroom for the shutdown recording save — see spec).
 - `ENV PYTHONUNBUFFERED=1` in the image (the demo consumer `print()`s one line per unit; without it, `docker logs` shows nothing until buffers flush).
 - Commits: Conventional Commits, no AI attribution.
 - All commands below run from the repo root: `C:\Users\djmcc\Desktop\Ocean\projects\sceptre-pipeline` (Git Bash path `/c/Users/djmcc/Desktop/Ocean/projects/sceptre-pipeline`).
