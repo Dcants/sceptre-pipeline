@@ -5,3 +5,6 @@ __pycache__/
 *.pyc
 .pytest_cache/
 docs/
+recordings/udp_capture_*.pkl
+.claude/
+.superpowers/

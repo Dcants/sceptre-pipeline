@@ -25,5 +25,9 @@ services:
     # /data lands bare `--record` output in /data/recordings == host ./recordings.
     working_dir: /data
     command: ["--live", "--host", "0.0.0.0", "--port", "${SCEPTRE_PORT:-5000}"]
+    # SIGINT (not the SIGTERM default) so `docker stop` takes the CLI's
+    # Ctrl-C clean-shutdown path: final flush + summaries + recording save.
+    # 60s grace: shutdown may pickle up to 512 MB of recording to a bind
+    # mount; SIGKILL mid-write truncates it.
     stop_signal: SIGINT
-    stop_grace_period: 10s
+    stop_grace_period: 60s
