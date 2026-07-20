@@ -154,6 +154,10 @@ COPY recordings/ recordings/
 COPY receiver/ receiver/
 
 RUN pytest tests/
+
+# Docker builds the LAST stage when no --target is given; re-export runtime
+# so an unqualified `docker build .` ships the runtime image, not test.
+FROM runtime
 ```
 
 - [ ] **Step 3: Run the test build**
