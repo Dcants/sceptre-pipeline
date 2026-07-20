@@ -48,10 +48,12 @@ No changes to pipeline source code — it is container-ready as-is.
     when misused, same as local).
 - **`test` target:** `FROM runtime`, runs as root throughout (it is a
   build-only stage, never shipped or run as a container),
-  `pip install --no-cache-dir .[dev]`, copy `tests/`, `conftest.py`, and
-  `recordings/` (tests use the two captures as wire-format ground truth), then
-  `RUN pytest` — so `docker build --target test .` fails the build if the
-  suite fails on that machine. This is the portability check.
+  `pip install --no-cache-dir .[dev]`, copy `tests/` (includes
+  `tests/conftest.py`), `recordings/` (tests use the two captures as
+  wire-format ground truth), and `receiver/` (one test imports
+  `receiver/recieve_udp.py`), then `RUN pytest tests/` — so
+  `docker build --target test .` fails the build if the suite fails on that
+  machine. This is the portability check.
 
 ## docker-compose.yml
 
@@ -65,8 +67,9 @@ No changes to pipeline source code — it is container-ready as-is.
   - Same build.
   - Ports: `"${SCEPTRE_PORT:-5000}:${SCEPTRE_PORT:-5000}/udp"`
   - Volume: `./recordings:/data/recordings` (read-write) with
-    `working_dir: /data/recordings`, so `--record`'s auto-named output lands on
-    the host.
+    `working_dir: /data` — `default_recording_path(cwd)` appends its own
+    `recordings/` subdirectory, so cwd `/data` puts auto-named `--record`
+    output at `/data/recordings/…`, which is the host's `./recordings/`.
   - Command: `--live --host 0.0.0.0 --port ${SCEPTRE_PORT:-5000}` — `--record`
     stays opt-in, appended by the user, matching CLI behavior.
   - `stop_signal: SIGINT` + `stop_grace_period: 10s`.
