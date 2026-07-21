@@ -40,6 +40,17 @@ Two threads, one bounded queue between them:
 Emitted units go to a pluggable `on_emit(unit)` callback, so a queue-backed sink
 can drop in later.
 
+## Multiple streams
+
+Multistream support is automatic — you don't need multiple listeners or any
+extra configuration. The Sceptre VITA-49 format multiplexes streams on a single
+UDP port: every packet carries a `stream_id` in its header, and the pipeline
+demuxes on that field — per-stream context, a separate accumulation buffer per
+stream, and each emitted unit tagged with its `stream_id`. The only related
+knob is `--max-streams` (default 64), a safety cap on how many distinct stream
+IDs are tracked so a flood of bogus IDs can't grow memory without limit;
+packets on streams beyond the cap are dropped and counted.
+
 ## Run it
 
 1. Install [Docker](https://docs.docker.com/get-docker/) if you don't have it.
