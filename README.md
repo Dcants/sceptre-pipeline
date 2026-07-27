@@ -11,7 +11,7 @@ VITA-49.2 subset (VRL disabled, no VRT trailer on context packets). The runtime 
 | Your situation | Prerequisites | The one command |
 |---|---|---|
 | Linux server or VM | Docker Engine or Podman | `SCEPTRE_PORT=5000 docker compose up live` |
-| Any OS, internet available | Python ≥ 3.10 | in a venv: `pip install .` then `python -m sceptre_pipeline --live --host 0.0.0.0 --port 5000` |
+| Any OS, internet available | Python ≥ 3.10 | in a venv: `pip install .` then `python -m sceptre_pipeline --live --host 0.0.0.0 --port 5000` from the src folder of this project |
 | Air-gapped, Python installed | Python ≥ 3.10 + a prepared `wheelhouse/` | `pip install --no-index --find-links wheelhouse .` |
 | No Python on the target | A build machine running the same OS | `python scripts/build_binary.py`, copy `dist/sceptre-pipeline` |
 
