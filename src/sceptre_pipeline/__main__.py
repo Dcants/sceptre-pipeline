@@ -1,4 +1,4 @@
-"""Stage 4 CLI: ``python -m sceptre_pipeline`` — replay a capture or go live.
+""" ``python -m sceptre_pipeline`` — replay a capture or go live.
 
 Wires the full pipeline (``BoundedRawQueue`` + ``Interpreter`` + per-stream
 ``BufferRouter`` + a source), runs the Thread B loop on the main thread, and
@@ -40,7 +40,9 @@ logger = logging.getLogger(__name__)
 # One second of the known 625 kHz Sceptre stream is a sensible default window.
 DEFAULT_MAX_SAMPLES = 625_000
 DEFAULT_MAX_AGE_S = 1.0
-DEFAULT_QUEUE_SIZE = 4096
+# Raw-queue depth: worst-case memory when full is ~270 MB (8 KiB datagrams);
+# the stall time it absorbs scales inversely with the incoming stream rate.
+DEFAULT_QUEUE_SIZE = 32768
 # DEFAULT_POLL_INTERVAL_S is imported from runtime so the CLI and library
 # defaults cannot drift.
 
