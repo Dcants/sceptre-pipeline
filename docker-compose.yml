@@ -17,15 +17,19 @@ services:
       context: .
       target: runtime
     image: sceptre-pipeline
-    ports:
-      # SCEPTRE_HOST pins listening to one host interface (default: all).
-      - "${SCEPTRE_HOST:-0.0.0.0}:${SCEPTRE_PORT:-5000}:${SCEPTRE_PORT:-5000}/udp"
+    # Linux Docker Engine / Podman only. Docker Desktop (Windows/Mac) cannot
+    # deliver externally-arriving UDP to published container ports, so live
+    # capture uses host networking: the container binds the host's network
+    # stack directly and no ports are published.
+    network_mode: host
     volumes:
       - ./recordings:/data/recordings
     # default_recording_path(cwd) appends its own recordings/ subdir, so cwd
     # /data lands bare `--record` output in /data/recordings == host ./recordings.
     working_dir: /data
-    command: ["--live", "--host", "0.0.0.0", "--port", "${SCEPTRE_PORT:-5000}"]
+    # Host networking and ports: are mutually exclusive, so SCEPTRE_HOST is now
+    # the app's own bind IP (default: all interfaces) rather than a publish address.
+    command: ["--live", "--host", "${SCEPTRE_HOST:-0.0.0.0}", "--port", "${SCEPTRE_PORT:-5000}"]
     # SIGINT (not the SIGTERM default) so `docker stop` takes the CLI's
     # Ctrl-C clean-shutdown path: final flush + summaries + recording save.
     # 60s grace: shutdown may pickle up to 512 MB of recording to a bind

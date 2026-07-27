@@ -7,6 +7,13 @@ dist/
 *.egg-info/
 .venv/
 
+# Deployment artifacts — regenerated per bundle, never committed.
+# wheelhouse/: offline-install wheels (scripts/build_wheelhouse.py).
+# *.spec: PyInstaller spec emitted by scripts/build_binary.py (binaries land
+# in the already-ignored build/ and dist/).
+wheelhouse/
+*.spec
+
 # Ad-hoc UDP captures. The two named fixtures
 # (recordings/single_frequency.pkl, recordings/change_frequency.pkl) stay tracked.
 # Unanchored pattern too: until Stage 1, recieve_udp.py writes captures to the CWD.
