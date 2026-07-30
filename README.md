@@ -4,7 +4,7 @@ Live ingestion pipeline for a Sceptre SDR that streams IQ data over UDP using a
 VITA-49.2 subset (VRL disabled, no VRT trailer on context packets). The runtime goal:
 
 > **UDP packets → interpret → accumulate → emit `{numpy array + typed context dict}`**
-> to downstream consumers (FFT / recording / audio).
+> to downstream consumers (FFT / recording / audio / rfml / etc.).
 
 ## Choose your deployment
 
@@ -77,7 +77,7 @@ NIC and the socket. From the repo folder:
 ```sh
 docker compose up live                                   # every interface, port 5000
 SCEPTRE_PORT=6000 docker compose up live                 # every interface, custom port
-SCEPTRE_HOST=192.0.2.10 SCEPTRE_PORT=6000 docker compose up live   # one interface
+SCEPTRE_HOST=192.0.2.10 SCEPTRE_PORT=6000 docker compose up live   # one interface, custom port
 ```
 
 With host networking, `SCEPTRE_HOST` is the IP the app itself binds (host
