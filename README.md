@@ -302,6 +302,35 @@ python receiver/recieve_udp.py --port 5000 --duration 5
 - **Linux containers:** the container writes recordings as uid 1000
   (`appuser`); if your user has a different uid, run `chmod a+w recordings`
   once, or add `--user "$(id -u):$(id -g)"` to `docker compose run`.
+- **`nvidia-container-runtime: executable file not found in $PATH`:** nothing in
+  this repo requests a GPU — this error comes from the *host* Docker daemon, not
+  from this project. Machines prepped for CUDA workloads often carry
+  `"default-runtime": "nvidia"` (or an `nvidia` runtime entry pointing at an
+  uninstalled binary) in `/etc/docker/daemon.json`, and that makes **every**
+  container on the host fail this way. Confirm with
+  `docker info | grep -i -A3 runtime` and `cat /etc/docker/daemon.json`, then
+  either:
+
+  - **This box doesn't need a GPU** — drop the `nvidia` runtime and
+    `default-runtime` entries from `/etc/docker/daemon.json`, then
+    `sudo systemctl restart docker`.
+  - **This box does run GPU workloads too** — install the NVIDIA Container
+    Toolkit so the binary the daemon references actually exists (Ubuntu/Debian):
+
+    ```sh
+    curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
+      | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+    curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+      | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+      | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+    sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit
+    sudo nvidia-ctk runtime configure --runtime=docker
+    sudo systemctl restart docker
+    ```
+
+  Locked-down enterprise and government base images ship Docker Engine without
+  the toolkit, so this bites on a fresh workstation even though this pipeline
+  runs on CPU and numpy alone.
 - **Docker Desktop (Windows/macOS):** cannot deliver externally-arriving UDP
   to containers, so live capture on these platforms must run natively — see
   [Choose your deployment](#choose-your-deployment).
